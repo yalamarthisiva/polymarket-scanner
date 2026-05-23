@@ -1,0 +1,5 @@
+.DS_Store
+*.csv
+*.html
+__pycache__/
+.env
