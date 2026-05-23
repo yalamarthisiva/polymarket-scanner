@@ -279,4 +279,4 @@ if AUTO_REFRESH:
     if remaining <= 1:
         st.session_state.last_refresh = time.time()
         st.cache_data.clear()
-    st.rerun()
+    st.rerun()# v3
