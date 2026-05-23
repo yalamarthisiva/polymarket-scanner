@@ -35,7 +35,7 @@ CAT_SPORTS   = st.sidebar.checkbox("⚽ Sports", value=True)
 CAT_POLITICS = st.sidebar.checkbox("🏛 Politics", value=True)
 CAT_CRYPTO   = st.sidebar.checkbox("₿ Crypto", value=True)
 CAT_CULTURE  = st.sidebar.checkbox("🎬 Culture / Entertainment", value=False)
-CAT_ALL      = st.sidebar.checkbox("🌐 Show All (ignore category filter)", value=False)
+CAT_ALL      = st.sidebar.checkbox("🌐 Show All (ignore category filter)", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Bet Side")
