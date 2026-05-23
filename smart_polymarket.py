@@ -32,81 +32,75 @@ FRAC_KELLY = st.sidebar.slider(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("US Market Categories")
-# Sports is the primary live category for US users right now
 CAT_SPORTS   = st.sidebar.checkbox("⚽ Sports", value=True)
 CAT_POLITICS = st.sidebar.checkbox("🏛 Politics", value=True)
 CAT_CRYPTO   = st.sidebar.checkbox("₿ Crypto", value=False)
 CAT_CULTURE  = st.sidebar.checkbox("🎬 Culture / Current Events", value=False)
 
 st.sidebar.markdown("---")
+DEBUG_MODE   = st.sidebar.checkbox("🔍 Show raw tags (debug)", value=False)
 AUTO_REFRESH = st.sidebar.checkbox("Auto Refresh", value=True)
 REFRESH_MIN  = st.sidebar.slider("Refresh every (minutes)", 3, 15, 5)
 
-# Build active category list from checkboxes
 ACTIVE_CATS = []
 if CAT_SPORTS:   ACTIVE_CATS.append("sports")
 if CAT_POLITICS: ACTIVE_CATS.append("politics")
 if CAT_CRYPTO:   ACTIVE_CATS.append("crypto")
 if CAT_CULTURE:  ACTIVE_CATS.extend(["culture", "entertainment", "current events"])
 
-# Sports keywords to help tag-match even when category metadata is sparse
 SPORTS_KEYWORDS = [
     "nba", "nfl", "mlb", "nhl", "ufc", "mma", "nascar", "pga", "tennis",
-    "soccer", "mls", "championship", "playoffs", "series", "superbowl",
-    "world series", "stanley cup", "finals", "draft", "transfer",
-    "win", "score", "game", "match", "season", "mvp", "title",
+    "soccer", "mls", "championship", "playoffs", "world series", "stanley cup",
+    "superbowl", "super bowl", "finals", "draft", "mvp", "title", "transfer",
+    "win the", "score", "game winner", "match", "season", "tournament",
+    "league", "cup", "series", "players championship", "grand slam",
 ]
 
 POLITICS_KEYWORDS = [
     "election", "president", "senate", "congress", "vote", "poll",
     "approval", "bill", "policy", "democrat", "republican", "governor",
-    "tariff", "fed", "supreme court",
+    "tariff", "fed rate", "supreme court", "white house", "executive order",
+    "secretary", "minister", "parliament", "referendum",
 ]
 
 CRYPTO_KEYWORDS = [
     "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol",
-    "defi", "nft", "token", "blockchain", "etf", "coinbase",
+    "defi", "nft", "token", "blockchain", "etf", "coinbase", "binance",
+    "xrp", "ripple", "doge", "dogecoin",
 ]
 
 CULTURE_KEYWORDS = [
     "oscar", "grammy", "emmy", "box office", "album", "movie", "show",
-    "celebrity", "award", "netflix", "spotify",
+    "celebrity", "award", "netflix", "spotify", "billboard",
 ]
 
 
-def market_matches_us_categories(title: str, tags_str: str, active_cats: list[str]) -> bool:
-    """Return True if this market fits at least one active US category."""
-    if not active_cats:
-        return False
+def detect_category(title: str, tags_str: str) -> str | None:
+    """Return category label if market matches any active category, else None."""
     combined = (title + " " + tags_str).lower()
 
-    if "sports" in active_cats:
-        if any(kw in combined for kw in SPORTS_KEYWORDS):
-            return True
-        if "sport" in combined:
-            return True
+    if "sports" in ACTIVE_CATS:
+        if any(kw in combined for kw in SPORTS_KEYWORDS) or "sport" in combined:
+            return "⚽ Sports"
 
-    if "politics" in active_cats:
-        if any(kw in combined for kw in POLITICS_KEYWORDS):
-            return True
-        if "politic" in combined:
-            return True
+    if "politics" in ACTIVE_CATS:
+        if any(kw in combined for kw in POLITICS_KEYWORDS) or "politic" in combined:
+            return "🏛 Politics"
 
-    if "crypto" in active_cats:
+    if "crypto" in ACTIVE_CATS:
         if any(kw in combined for kw in CRYPTO_KEYWORDS):
-            return True
+            return "₿ Crypto"
 
-    if any(c in active_cats for c in ["culture", "entertainment", "current events"]):
+    if any(c in ACTIVE_CATS for c in ["culture", "entertainment", "current events"]):
         if any(kw in combined for kw in CULTURE_KEYWORDS):
-            return True
+            return "🎬 Culture"
 
-    return False
+    return None
 
 
 # ================== DATA LAYER ==================
 @st.cache_data(ttl=180, show_spinner="Fetching market data...")
 def fetch_market_data() -> list[dict]:
-    """Raw fetch — no filter logic so cache is filter-agnostic."""
     try:
         r = requests.get(
             "https://gamma-api.polymarket.com/events",
@@ -134,7 +128,7 @@ def kelly_fraction(true_prob: float, market_prob: float) -> float:
 
 
 def analyze(markets, bankroll, min_kelly, min_volume,
-            min_prob, max_prob, edge_pct, frac_kelly, active_cats) -> pd.DataFrame:
+            min_prob, max_prob, edge_pct, frac_kelly) -> pd.DataFrame:
     results = []
 
     for m in markets:
@@ -144,20 +138,10 @@ def analyze(markets, bankroll, min_kelly, min_volume,
         if volume < min_volume:
             continue
 
-        tags_str = str(m.get("tags", "")) + str(m.get("categories", ""))
-        if not market_matches_us_categories(title, tags_str, active_cats):
+        tags_str  = str(m.get("tags", "")) + " " + str(m.get("categories", ""))
+        cat_label = detect_category(title, tags_str)
+        if cat_label is None:
             continue
-
-        # Tag which category matched (for display)
-        combined = (title + " " + tags_str).lower()
-        if any(kw in combined for kw in SPORTS_KEYWORDS) or "sport" in combined:
-            cat_label = "⚽ Sports"
-        elif any(kw in combined for kw in POLITICS_KEYWORDS) or "politic" in combined:
-            cat_label = "🏛 Politics"
-        elif any(kw in combined for kw in CRYPTO_KEYWORDS):
-            cat_label = "₿ Crypto"
-        else:
-            cat_label = "🎬 Culture"
 
         try:
             outcomes = json.loads(m.get("outcomes", "[]"))
@@ -219,6 +203,22 @@ if manual_refresh:
     st.cache_data.clear()
     markets = fetch_market_data()
 
+# ── DEBUG MODE ──────────────────────────────────────────────────────────────
+if DEBUG_MODE:
+    st.subheader("🔍 Raw API sample (first 30 markets)")
+    st.caption("Use this to see actual tag/category values from the API")
+    debug_rows = []
+    for m in markets[:30]:
+        debug_rows.append({
+            "title": m.get("question", "")[:70],
+            "tags":  str(m.get("tags", ""))[:80],
+            "cats":  str(m.get("categories", ""))[:80],
+            "vol":   m.get("volumeNum", 0),
+        })
+    st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+    st.stop()
+# ───────────────────────────────────────────────────────────────────────────
+
 df = analyze(
     markets,
     bankroll=BANKROLL,
@@ -228,7 +228,6 @@ df = analyze(
     max_prob=MAX_PROB,
     edge_pct=EDGE_FLOOR,
     frac_kelly=FRAC_KELLY,
-    active_cats=ACTIVE_CATS,
 )
 
 with col_time:
@@ -245,6 +244,11 @@ elif df.empty:
         "lowering Min Kelly % to 1, or widening the probability range."
     )
 else:
+    cat_counts = df["Category"].value_counts()
+    cols = st.columns(len(cat_counts))
+    for col, (cat, count) in zip(cols, cat_counts.items()):
+        col.metric(cat, count)
+
     display_df = df.copy()
     display_df["Mkt Prob"]   = display_df["Mkt Prob"].map("{:.1%}".format)
     display_df["True Prob"]  = display_df["True Prob"].map("{:.1%}".format)
@@ -253,12 +257,6 @@ else:
     display_df["EV %"]       = display_df["EV %"].map("{:+.1f}%".format)
     display_df["Bet ($)"]    = display_df["Bet ($)"].map("${:,.0f}".format)
     display_df["Volume ($)"] = display_df["Volume ($)"].map("${:,.0f}".format)
-
-    # Category breakdown
-    cat_counts = df["Category"].value_counts()
-    cols = st.columns(len(cat_counts))
-    for col, (cat, count) in zip(cols, cat_counts.items()):
-        col.metric(cat, count)
 
     st.dataframe(display_df, use_container_width=True, height=600)
     st.success(f"Found **{len(df)}** tradeable opportunities")
