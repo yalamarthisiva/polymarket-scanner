@@ -1,5 +1,7 @@
 import json
+import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -10,13 +12,28 @@ import streamlit as st
 
 
 POLYMARKET_US_BASE_URL = "https://gateway.polymarket.us/v1"
+FIFA_MENS_RANKINGS_URL = "https://api.fifa.com/api/v3/rankings"
+FIFA_RATING_BASELINE = 1500.0
+FIFA_ELO_SCALE = 400.0
+
+FIFA_COUNTRY_ALIASES = {
+    "CPV": ["Cabo Verde", "Cape Verde"],
+    "CZE": ["Czechia", "Czech Republic"],
+    "IRN": ["IR Iran", "Iran"],
+    "KOR": ["Korea Republic", "South Korea", "Korea"],
+    "KSA": ["Saudi Arabia"],
+    "TUR": ["Turkiye", "Turkey"],
+    "UAE": ["United Arab Emirates", "UAE"],
+    "USA": ["USA", "United States", "United States of America", "US"],
+}
 
 
 st.set_page_config(page_title="Smart Polymarket Value Tool", layout="wide")
 st.title("Smart Polymarket Value Tool")
 st.info(
-    "Using the Polymarket US public API only. This tool only calculates value "
-    "when you provide your own true probability."
+    "Using the Polymarket US public API only. Automated estimates are simple "
+    "heuristics from ESPN/MLB standings, FIFA rankings, in-market records, "
+    "and conservative market-consensus fallback."
 )
 
 
@@ -27,8 +44,12 @@ class MarketOutcome:
     market_id: str
     slug: str
     category: str
+    event_name: str
     market_name: str
     outcome: str
+    participant: str
+    league: str
+    record: str
     market_prob: float
     volume: float | None
     liquidity: float | None
@@ -41,7 +62,7 @@ class ProbabilityEstimate:
 
 
 class ProbabilityProvider(Protocol):
-    """Small extension point for manual inputs, files, or future models."""
+    """Small extension point for automated probability models."""
 
     def get(self, outcome: MarketOutcome) -> ProbabilityEstimate | None:
         ...
@@ -65,57 +86,40 @@ class AnalysisConfig:
     include_politics: bool
     include_crypto: bool
     include_culture: bool
+    use_auto_model: bool
+    model_blend: float
+    use_market_consensus_fallback: bool
+    skip_politics_auto_model: bool
+
+
+@dataclass(frozen=True)
+class ParsedOutcome:
+    outcome: str
+    price: float
+    participant: str
+    league: str
+    record: str
+
+
+@dataclass(frozen=True)
+class TeamRating:
+    name: str
+    league: str
+    rating: float
+    source: str
+
+
+@dataclass(frozen=True)
+class SportsModelData:
+    ratings: dict[tuple[str, str], TeamRating]
 
 
 @dataclass
-class FileProbabilityProvider:
-    by_key: dict[str, ProbabilityEstimate]
-    by_market_outcome: dict[tuple[str, str], ProbabilityEstimate]
-    group_rules: list[dict]
-
-    def get(self, outcome: MarketOutcome) -> ProbabilityEstimate | None:
-        if outcome.key in self.by_key:
-            return self.by_key[outcome.key]
-
-        name_key = (outcome.market_name.lower(), outcome.outcome.lower())
-        if name_key in self.by_market_outcome:
-            return self.by_market_outcome[name_key]
-
-        for rule in self.group_rules:
-            contains = rule.get("contains")
-            category = rule.get("category")
-            rule_outcome = rule.get("outcome")
-
-            if contains and contains.lower() not in outcome.market_name.lower():
-                continue
-            if category and category.lower() != outcome.category.lower():
-                continue
-            if rule_outcome and rule_outcome.lower() != outcome.outcome.lower():
-                continue
-
-            return ProbabilityEstimate(rule["true_prob"], rule["source"])
-
-        return None
-
-
-@dataclass
-class ManualProbabilityProvider:
+class AutoModelProbabilityProvider:
     by_key: dict[str, ProbabilityEstimate]
 
     def get(self, outcome: MarketOutcome) -> ProbabilityEstimate | None:
         return self.by_key.get(outcome.key)
-
-
-@dataclass
-class CompositeProbabilityProvider:
-    providers: list[ProbabilityProvider]
-
-    def get(self, outcome: MarketOutcome) -> ProbabilityEstimate | None:
-        for provider in self.providers:
-            estimate = provider.get(outcome)
-            if estimate is not None:
-                return estimate
-        return None
 
 
 # ================== SIDEBAR CONTROLS ==================
@@ -144,7 +148,7 @@ PROB_RANGE = st.sidebar.slider(
     "Polymarket probability range",
     min_value=0.01,
     max_value=0.99,
-    value=(0.20, 0.80),
+    value=(0.01, 0.99),
     step=0.01,
 )
 MIN_VOLUME = st.sidebar.number_input(
@@ -166,6 +170,27 @@ SORT_BY = st.sidebar.selectbox(
     ],
 )
 SORT_ASCENDING = st.sidebar.checkbox("Sort ascending", value=False)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Automation")
+USE_AUTO_MODEL = st.sidebar.checkbox("Use automated true probabilities", value=True)
+MODEL_BLEND = st.sidebar.slider(
+    "Model weight",
+    min_value=0.05,
+    max_value=1.0,
+    value=0.35,
+    step=0.05,
+    help=(
+        "How much to trust the simple statistical model versus de-vigged market "
+        "consensus. Lower is more conservative."
+    ),
+)
+USE_MARKET_CONSENSUS_FALLBACK = st.sidebar.checkbox(
+    "Fill unsupported markets with market consensus", value=True
+)
+SKIP_POLITICS_AUTO_MODEL = st.sidebar.checkbox(
+    "Skip politics automation until polling model exists", value=True
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Categories")
@@ -208,6 +233,10 @@ CONFIG = AnalysisConfig(
     include_politics=CAT_POLITICS,
     include_crypto=CAT_CRYPTO,
     include_culture=CAT_CULTURE,
+    use_auto_model=USE_AUTO_MODEL,
+    model_blend=MODEL_BLEND,
+    use_market_consensus_fallback=USE_MARKET_CONSENSUS_FALLBACK,
+    skip_politics_auto_model=SKIP_POLITICS_AUTO_MODEL,
 )
 
 
@@ -234,6 +263,62 @@ def fetch_market_data() -> list[dict]:
         return []
 
 
+@st.cache_data(ttl=900, show_spinner="Fetching public sports standings...")
+def fetch_sports_model_data() -> SportsModelData:
+    ratings: dict[tuple[str, str], TeamRating] = {}
+
+    for league, url, source in [
+        (
+            "nba",
+            "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings"
+            "?region=us&lang=en&contentorigin=espn&type=0&level=2"
+            "&sort=playoffseed%3Aasc",
+            "ESPN standings",
+        ),
+        (
+            "nhl",
+            "https://site.web.api.espn.com/apis/v2/sports/hockey/nhl/standings"
+            "?region=us&lang=en&contentorigin=espn&type=0&level=2"
+            "&sort=playoffseed%3Aasc",
+            "ESPN standings",
+        ),
+    ]:
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            ratings.update(parse_espn_team_ratings(response.json(), league, source))
+        except Exception:
+            continue
+
+    try:
+        response = requests.get(
+            "https://statsapi.mlb.com/api/v1/standings",
+            params={
+                "leagueId": "103,104",
+                "season": datetime.now().year,
+                "standingsTypes": "regularSeason",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        ratings.update(parse_mlb_team_ratings(response.json()))
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(
+            FIFA_MENS_RANKINGS_URL,
+            params={"gender": "male"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        ratings.update(parse_fifa_team_ratings(response.json()))
+    except Exception:
+        pass
+
+    return SportsModelData(ratings=ratings)
+
+
 # ================== PARSING HELPERS ==================
 def optional_float(value) -> float | None:
     try:
@@ -253,6 +338,177 @@ def normalize_probability(value) -> float | None:
     if 0 <= prob <= 1:
         return prob
     return None
+
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def rating_keys(league: str, *names: str) -> list[tuple[str, str]]:
+    keys = []
+    for name in names:
+        if name:
+            keys.append((league.lower(), normalize_name(name)))
+    return keys
+
+
+def add_team_rating(
+    ratings: dict[tuple[str, str], TeamRating],
+    league: str,
+    rating: TeamRating,
+    *aliases: str,
+):
+    for key in rating_keys(league, *aliases):
+        ratings[key] = rating
+
+
+def iter_espn_standing_entries(node: dict):
+    standings = node.get("standings")
+    if isinstance(standings, dict):
+        for entry in standings.get("entries", []) or []:
+            yield entry
+
+    for child in node.get("children", []) or []:
+        yield from iter_espn_standing_entries(child)
+
+
+def parse_espn_team_ratings(payload: dict, league: str, source: str) -> dict[tuple[str, str], TeamRating]:
+    ratings: dict[tuple[str, str], TeamRating] = {}
+
+    for entry in iter_espn_standing_entries(payload):
+        team = entry.get("team", {})
+        stats = {stat.get("name"): stat.get("value") for stat in entry.get("stats", [])}
+        wins = optional_float(stats.get("wins")) or 0.0
+        losses = optional_float(stats.get("losses")) or 0.0
+        ot_losses = optional_float(stats.get("otLosses")) or 0.0
+        points = optional_float(stats.get("points"))
+        games = wins + losses + ot_losses
+
+        if games <= 0:
+            continue
+
+        if league == "nhl" and points is not None:
+            rating_value = points / (2 * games)
+        else:
+            rating_value = wins / games
+
+        rating = TeamRating(
+            name=team.get("displayName") or team.get("name") or "",
+            league=league,
+            rating=max(0.01, min(0.99, rating_value)),
+            source=source,
+        )
+        add_team_rating(
+            ratings,
+            league,
+            rating,
+            team.get("displayName", ""),
+            team.get("shortDisplayName", ""),
+            team.get("name", ""),
+            team.get("abbreviation", ""),
+        )
+
+    return ratings
+
+
+def parse_mlb_team_ratings(payload: dict) -> dict[tuple[str, str], TeamRating]:
+    ratings: dict[tuple[str, str], TeamRating] = {}
+
+    for record_group in payload.get("records", []) or []:
+        for team_record in record_group.get("teamRecords", []) or []:
+            team = team_record.get("team", {})
+            wins = optional_float(team_record.get("wins")) or 0.0
+            losses = optional_float(team_record.get("losses")) or 0.0
+            games = wins + losses
+            if games <= 0:
+                continue
+
+            rating = TeamRating(
+                name=team.get("name", ""),
+                league="mlb",
+                rating=max(0.01, min(0.99, wins / games)),
+                source="MLB Stats API standings",
+            )
+            add_team_rating(ratings, "mlb", rating, team.get("name", ""))
+
+    return ratings
+
+
+def localized_description(value, locale: str = "en-GB") -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+
+    fallback = ""
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        description = item.get("Description") or item.get("description") or ""
+        if not fallback:
+            fallback = description
+        if item.get("Locale") == locale and description:
+            return description
+
+    return fallback
+
+
+def parse_fifa_team_ratings(payload: dict) -> dict[tuple[str, str], TeamRating]:
+    ratings: dict[tuple[str, str], TeamRating] = {}
+    rows = payload.get("Results") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return ratings
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        country_code = str(row.get("IdCountry") or "")
+        name = localized_description(row.get("TeamName"))
+        points = optional_float(row.get("DecimalTotalPoints") or row.get("TotalPoints"))
+        if not name or points is None:
+            continue
+
+        pub_date = str(row.get("PubDate") or "")[:10]
+        source = "FIFA men's ranking"
+        if pub_date:
+            source = f"{source} {pub_date}"
+
+        # FIFA ranking points are Elo-like. Convert point differences into a
+        # relative strength, then normalize within each Polymarket event.
+        rating = TeamRating(
+            name=name,
+            league="fifawc",
+            rating=max(0.01, 10 ** ((points - FIFA_RATING_BASELINE) / FIFA_ELO_SCALE)),
+            source=source,
+        )
+        add_team_rating(
+            ratings,
+            "fifawc",
+            rating,
+            name,
+            country_code,
+            *FIFA_COUNTRY_ALIASES.get(country_code, []),
+        )
+
+    return ratings
+
+
+def parse_record_rating(record: str) -> float | None:
+    if not record:
+        return None
+    match = re.fullmatch(r"\s*(\d+)-(\d+)(?:-(\d+))?\s*", record)
+    if not match:
+        return None
+
+    wins = float(match.group(1))
+    losses = float(match.group(2))
+    draws_or_ot = float(match.group(3) or 0)
+    games = wins + losses + draws_or_ot
+    if games <= 0:
+        return None
+
+    return max(0.01, min(0.99, (wins + 0.5 * draws_or_ot) / games))
 
 
 def get_quote_value(value) -> float | None:
@@ -288,6 +544,18 @@ def clear_market_name(market: dict) -> str:
     return " - ".join(pieces)
 
 
+def clear_outcome_market_name(market: dict, parsed_outcome: ParsedOutcome) -> str:
+    pieces = [clear_market_name(market)]
+    if parsed_outcome.participant and parsed_outcome.participant not in pieces[0]:
+        pieces.append(parsed_outcome.participant)
+    if (
+        parsed_outcome.record
+        and not re.search(r"\b\d+-\d+(?:-\d+)?\b", " - ".join(pieces))
+    ):
+        pieces.append(parsed_outcome.record)
+    return " - ".join(piece for piece in pieces if piece)
+
+
 def category_allowed(category: str, config: AnalysisConfig) -> bool:
     if config.include_all_categories:
         return True
@@ -320,15 +588,28 @@ def market_side_price(side: dict) -> float | None:
     )
 
 
-def market_outcomes(market: dict) -> list[tuple[str, float]]:
+def market_outcomes(market: dict) -> list[ParsedOutcome]:
     sides = market.get("marketSides")
     if isinstance(sides, list) and sides:
         outcomes = []
         for side in sides:
             name = side.get("description") or ("Yes" if side.get("long") else "No")
             price = market_side_price(side)
+            team = side.get("team") or {}
             if price is not None:
-                outcomes.append((name, price))
+                outcomes.append(
+                    ParsedOutcome(
+                        outcome=name,
+                        price=price,
+                        participant=team.get("safeName")
+                        or team.get("name")
+                        or team.get("alias")
+                        or team.get("displayAbbreviation")
+                        or "",
+                        league=(team.get("league") or "").lower(),
+                        record=team.get("record") or "",
+                    )
+                )
         return outcomes
 
     try:
@@ -341,7 +622,15 @@ def market_outcomes(market: dict) -> list[tuple[str, float]]:
     for name, price_value in zip(names, prices):
         price = optional_float(price_value)
         if price is not None:
-            outcomes.append((name, price))
+            outcomes.append(
+                ParsedOutcome(
+                    outcome=name,
+                    price=price,
+                    participant="",
+                    league="",
+                    record="",
+                )
+            )
     return outcomes
 
 
@@ -377,7 +666,7 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
             stats["Category skipped"] += 1
             continue
 
-        market_name = clear_market_name(market)
+        event_name = clear_market_name(market)
         volume = get_market_volume(market)
         liquidity = get_market_liquidity(market)
 
@@ -398,24 +687,28 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
             stats["No price data skipped"] += 1
             continue
 
-        for outcome, market_prob in outcomes:
-            if not side_allowed(outcome, config):
+        for parsed_outcome in outcomes:
+            if not side_allowed(parsed_outcome.outcome, config):
                 stats["Side skipped"] += 1
                 continue
 
-            if not (config.min_market_prob <= market_prob <= config.max_market_prob):
+            if not (config.min_market_prob <= parsed_outcome.price <= config.max_market_prob):
                 stats["Probability skipped"] += 1
                 continue
 
             rows.append(
                 MarketOutcome(
-                    key=make_market_key(market, outcome),
+                    key=make_market_key(market, parsed_outcome.outcome),
                     market_id=str(market.get("id", "")),
                     slug=str(market.get("slug", "")),
                     category=category,
-                    market_name=market_name,
-                    outcome=outcome,
-                    market_prob=market_prob,
+                    event_name=event_name,
+                    market_name=clear_outcome_market_name(market, parsed_outcome),
+                    outcome=parsed_outcome.outcome,
+                    participant=parsed_outcome.participant,
+                    league=parsed_outcome.league,
+                    record=parsed_outcome.record,
+                    market_prob=parsed_outcome.price,
                     volume=volume,
                     liquidity=liquidity,
                 )
@@ -425,95 +718,140 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
     return rows, stats
 
 
-# ================== PROBABILITY INPUTS ==================
-def empty_file_provider() -> FileProbabilityProvider:
-    return FileProbabilityProvider(by_key={}, by_market_outcome={}, group_rules=[])
+# ================== AUTOMATED MODELS ==================
+def lookup_team_rating(data: SportsModelData, league: str, participant: str) -> TeamRating | None:
+    if not league or not participant:
+        return None
+
+    normalized = normalize_name(participant)
+    exact = data.ratings.get((league.lower(), normalized))
+    if exact:
+        return exact
+
+    for (rating_league, rating_name), rating in data.ratings.items():
+        if rating_league != league.lower():
+            continue
+        if normalized and (normalized in rating_name or rating_name in normalized):
+            return rating
+
+    return None
 
 
-def estimate_from_row(row: dict, source: str) -> tuple[str | None, ProbabilityEstimate | None]:
-    true_prob = normalize_probability(
-        row.get("true_prob")
-        or row.get("my_true_prob")
-        or row.get("My True Probability")
-        or row.get("My True Probability %")
-    )
-    if true_prob is None:
-        return None, None
+def outcome_strength(
+    outcome: MarketOutcome, sports_data: SportsModelData
+) -> tuple[float, str] | None:
+    rating = lookup_team_rating(sports_data, outcome.league, outcome.participant)
+    if rating is not None:
+        return rating.rating, f"auto:rating:{rating.source}"
 
-    key = row.get("key") or row.get("market_key") or row.get("Market Key")
-    return key, ProbabilityEstimate(true_prob=true_prob, source=source)
+    record_rating = parse_record_rating(outcome.record)
+    if record_rating is not None:
+        return record_rating, "auto:record-in-market"
+
+    return None
 
 
-def load_probability_file(uploaded_file) -> FileProbabilityProvider:
-    if uploaded_file is None:
-        return empty_file_provider()
+def event_exponent(group: list[MarketOutcome]) -> float:
+    if any(outcome.league == "fifawc" for outcome in group):
+        return 1.0
+
+    event = group[0].event_name.lower()
+    if "champion" in event or "winner" in event:
+        return 4.0
+    return 2.0
+
+
+def de_vigged_market_probs(group: list[MarketOutcome]) -> dict[str, float]:
+    total_prob = sum(outcome.market_prob for outcome in group if outcome.market_prob > 0)
+    if total_prob <= 0:
+        return {}
+    return {outcome.key: outcome.market_prob / total_prob for outcome in group}
+
+
+def build_event_model_estimates(
+    group: list[MarketOutcome],
+    sports_data: SportsModelData,
+    config: AnalysisConfig,
+) -> dict[str, ProbabilityEstimate]:
+    strengths = {}
+    sources = {}
+
+    for outcome in group:
+        strength = outcome_strength(outcome, sports_data)
+        if strength is None:
+            continue
+        strengths[outcome.key] = strength[0]
+        sources[outcome.key] = strength[1]
+
+    if len(strengths) < 2:
+        return {}
+
+    exponent = event_exponent(group)
+    raw_scores = {
+        key: max(0.001, strength) ** exponent
+        for key, strength in strengths.items()
+    }
+    score_total = sum(raw_scores.values())
+    if score_total <= 0:
+        return {}
+
+    market_probs = de_vigged_market_probs(group)
+    estimates = {}
+    for outcome in group:
+        if outcome.key not in raw_scores:
+            continue
+
+        model_prob = raw_scores[outcome.key] / score_total
+        market_prob = market_probs.get(outcome.key, outcome.market_prob)
+        true_prob = (
+            config.model_blend * model_prob
+            + (1 - config.model_blend) * market_prob
+        )
+        estimates[outcome.key] = ProbabilityEstimate(
+            true_prob=max(0.001, min(0.999, true_prob)),
+            source=f"{sources[outcome.key]} ({config.model_blend:.0%} model blend)",
+        )
+
+    return estimates
+
+
+def build_auto_model_provider(
+    outcomes: list[MarketOutcome],
+    sports_data: SportsModelData,
+    config: AnalysisConfig,
+) -> AutoModelProbabilityProvider:
+    if not config.use_auto_model:
+        return AutoModelProbabilityProvider(by_key={})
 
     by_key: dict[str, ProbabilityEstimate] = {}
-    by_market_outcome: dict[tuple[str, str], ProbabilityEstimate] = {}
-    group_rules: list[dict] = []
-    filename = uploaded_file.name
+    groups: dict[str, list[MarketOutcome]] = defaultdict(list)
 
-    try:
-        if filename.lower().endswith(".csv"):
-            source_df = pd.read_csv(uploaded_file)
-            records = source_df.to_dict("records")
-        else:
-            payload = json.load(uploaded_file)
-            if isinstance(payload, dict) and "probabilities" in payload:
-                records = payload["probabilities"]
-            elif isinstance(payload, dict):
-                records = [{"key": key, "true_prob": value} for key, value in payload.items()]
-            elif isinstance(payload, list):
-                records = payload
-            else:
-                records = []
-    except Exception as exc:
-        st.warning(f"Could not read probability file: {exc}")
-        return empty_file_provider()
-
-    for row in records:
-        if not isinstance(row, dict):
+    for outcome in outcomes:
+        if config.skip_politics_auto_model and outcome.category == "politics":
             continue
-
-        true_prob = normalize_probability(
-            row.get("true_prob")
-            or row.get("my_true_prob")
-            or row.get("My True Probability")
-            or row.get("My True Probability %")
-        )
-        if true_prob is None:
+        if outcome.outcome.strip().upper() != "YES":
             continue
+        groups[outcome.event_name].append(outcome)
 
-        estimate = ProbabilityEstimate(true_prob=true_prob, source=f"file:{filename}")
-        key = row.get("key") or row.get("market_key") or row.get("Market Key")
-        market = row.get("market") or row.get("Market")
-        outcome = row.get("outcome") or row.get("Outcome")
-        contains = row.get("contains") or row.get("market_contains")
-        category = row.get("category") or row.get("Category")
+    for group in groups.values():
+        by_key.update(build_event_model_estimates(group, sports_data, config))
 
-        if key:
-            by_key[str(key)] = estimate
-        elif market and outcome:
-            by_market_outcome[(str(market).lower(), str(outcome).lower())] = estimate
-        elif contains or category:
-            group_rules.append(
-                {
-                    "contains": str(contains) if contains else None,
-                    "category": str(category) if category else None,
-                    "outcome": str(outcome) if outcome else None,
-                    "true_prob": true_prob,
-                    "source": f"file:{filename}",
-                }
-            )
+    if config.use_market_consensus_fallback:
+        for group in groups.values():
+            market_probs = de_vigged_market_probs(group)
+            for outcome in group:
+                if outcome.key in by_key:
+                    continue
+                true_prob = market_probs.get(outcome.key, outcome.market_prob)
+                by_key[outcome.key] = ProbabilityEstimate(
+                    true_prob=max(0.001, min(0.999, true_prob)),
+                    source="auto:market-consensus",
+                )
 
-    return FileProbabilityProvider(
-        by_key=by_key,
-        by_market_outcome=by_market_outcome,
-        group_rules=group_rules,
-    )
+    return AutoModelProbabilityProvider(by_key=by_key)
 
 
-def build_probability_editor_df(
+def build_estimate_display_df(
     outcomes: list[MarketOutcome], provider: ProbabilityProvider
 ) -> pd.DataFrame:
     rows = []
@@ -521,50 +859,29 @@ def build_probability_editor_df(
         estimate = provider.get(outcome)
         rows.append(
             {
-                "Market Key": outcome.key,
                 "Market": outcome.market_name,
                 "Outcome": outcome.outcome,
                 "Polymarket Probability": outcome.market_prob * 100,
-                "My True Probability %": (
+                "Auto True Probability %": (
                     estimate.true_prob * 100 if estimate is not None else None
                 ),
-                "Source": estimate.source if estimate is not None else "",
+                "Model Source": estimate.source if estimate is not None else "no model",
                 "Category": outcome.category,
-                "Volume": outcome.volume,
-                "Liquidity": outcome.liquidity,
+                "League": outcome.league,
+                "Record": outcome.record,
+                "Market Key": outcome.key,
             }
         )
     return pd.DataFrame(rows)
 
 
-def manual_provider_from_editor(
-    editor_df: pd.DataFrame, file_provider: ProbabilityProvider
-) -> ManualProbabilityProvider:
-    by_key = {}
-    if editor_df.empty:
-        return ManualProbabilityProvider(by_key=by_key)
-
-    for row in editor_df.to_dict("records"):
-        key = row.get("Market Key")
-        true_prob = normalize_probability(row.get("My True Probability %"))
-        if key and true_prob is not None:
-            seed_outcome = MarketOutcome(
-                key=str(key),
-                market_id="",
-                slug="",
-                category=str(row.get("Category") or ""),
-                market_name=str(row.get("Market") or ""),
-                outcome=str(row.get("Outcome") or ""),
-                market_prob=0.0,
-                volume=None,
-                liquidity=None,
-            )
-            file_estimate = file_provider.get(seed_outcome)
-            if file_estimate and abs(file_estimate.true_prob - true_prob) < 0.000001:
-                continue
-            by_key[str(key)] = ProbabilityEstimate(true_prob=true_prob, source="manual")
-
-    return ManualProbabilityProvider(by_key=by_key)
+def count_auto_estimates(estimate_df: pd.DataFrame) -> int:
+    if estimate_df.empty or "Auto True Probability %" not in estimate_df:
+        return 0
+    return sum(
+        normalize_probability(value) is not None
+        for value in estimate_df["Auto True Probability %"]
+    )
 
 
 # ================== VALUE MATH ==================
@@ -700,26 +1017,10 @@ def display_value_table(df: pd.DataFrame):
                 "Source",
             ]
         ],
-        use_container_width=True,
+        width="stretch",
         height=620,
         hide_index=True,
     )
-
-
-def download_template(outcomes: list[MarketOutcome]) -> bytes:
-    template_df = pd.DataFrame(
-        [
-            {
-                "Market Key": outcome.key,
-                "Market": outcome.market_name,
-                "Outcome": outcome.outcome,
-                "Polymarket Probability": round(outcome.market_prob, 4),
-                "My True Probability %": "",
-            }
-            for outcome in outcomes
-        ]
-    )
-    return template_df.to_csv(index=False).encode()
 
 
 # ================== APP FLOW ==================
@@ -747,99 +1048,92 @@ with col_time:
 if DEBUG_MODE:
     st.subheader("Raw candidate outcomes")
     debug_df = pd.DataFrame([outcome.__dict__ for outcome in outcomes])
-    st.dataframe(debug_df, use_container_width=True, hide_index=True)
+    st.dataframe(debug_df, width="stretch", hide_index=True)
     st.stop()
 
-st.subheader("1. Add Your True Probabilities")
+st.subheader("1. Automated True Probability Estimates")
 st.caption(
-    "Upload estimates or type them below. Values may be entered as 0.62 or 62 for 62%."
+    "The app estimates probabilities automatically from public NBA/NHL/MLB "
+    "standings, FIFA men's rankings, and records embedded in markets. "
+    "Unsupported markets use a neutral market-consensus fallback or stay blank, "
+    "depending on your sidebar settings."
 )
 
-uploaded_probabilities = st.file_uploader(
-    "Load true probabilities from CSV or JSON",
-    type=["csv", "json"],
-)
-file_provider = load_probability_file(uploaded_probabilities)
-
-template_col, stats_col = st.columns([1, 3])
-with template_col:
-    st.download_button(
-        "Download CSV template",
-        download_template(outcomes),
-        "polymarket_true_prob_template.csv",
-        "text/csv",
-    )
-with stats_col:
-    with st.expander("File formats and scan stats"):
-        st.markdown(
-            """
-CSV columns accepted: `Market Key`, `My True Probability %`.
-
-Optional CSV/JSON columns for bulk rules: `contains`, `category`, `outcome`, `true_prob`.
-
-JSON accepted: `{"market-key::yes": 0.62}` or a list of rows with `key` and `true_prob`.
-"""
-        )
-        st.dataframe(
-            pd.DataFrame(
-                [{"Step": key, "Count": value} for key, value in scan_stats.items()]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-editor_seed_provider = CompositeProbabilityProvider([file_provider])
-editor_df = build_probability_editor_df(outcomes, editor_seed_provider)
-
-if editor_df.empty:
+if not outcomes:
     st.warning("No markets match the current filters.")
     st.stop()
 
-edited_df = st.data_editor(
-    editor_df,
-    use_container_width=True,
-    hide_index=True,
-    height=360,
-    disabled=[
-        "Market Key",
-        "Market",
-        "Outcome",
-        "Polymarket Probability",
-        "Source",
-        "Category",
-        "Volume",
-        "Liquidity",
-    ],
-    column_order=[
-        "Market",
-        "Outcome",
-        "Polymarket Probability",
-        "My True Probability %",
-        "Source",
-        "Category",
-        "Volume",
-        "Liquidity",
-        "Market Key",
-    ],
-    key="true_probability_editor",
-)
+sports_model_data = fetch_sports_model_data() if CONFIG.use_auto_model else SportsModelData(ratings={})
+auto_provider = build_auto_model_provider(outcomes, sports_model_data, CONFIG)
+estimate_df = build_estimate_display_df(outcomes, auto_provider)
+auto_estimate_count = count_auto_estimates(estimate_df)
 
-manual_provider = manual_provider_from_editor(edited_df, file_provider)
-probability_provider = CompositeProbabilityProvider([manual_provider, file_provider])
+estimate_cols = st.columns(4)
+estimate_cols[0].metric("Candidate outcomes", len(outcomes))
+estimate_cols[1].metric("Automated estimates", auto_estimate_count)
+estimate_cols[2].metric("Still missing", max(0, len(outcomes) - auto_estimate_count))
+estimate_cols[3].metric("Sports rating keys", len(sports_model_data.ratings))
+
+if auto_estimate_count == 0:
+    st.warning(
+        "No automated estimates were generated. Turn on automated probabilities, "
+        "enable market-consensus fallback, or widen the market filters."
+    )
+
+with st.expander("Model coverage and scan stats", expanded=False):
+    coverage_df = estimate_df.copy()
+    if coverage_df.empty:
+        st.info("No model coverage to display for the current filters.")
+    else:
+        coverage_df["Polymarket Probability"] = coverage_df["Polymarket Probability"].map(
+            "{:.1f}%".format
+        )
+        coverage_df["Auto True Probability %"] = coverage_df["Auto True Probability %"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
+        )
+        st.dataframe(
+            coverage_df[
+                [
+                    "Market",
+                    "Outcome",
+                    "Polymarket Probability",
+                    "Auto True Probability %",
+                    "Model Source",
+                    "Category",
+                    "League",
+                    "Record",
+                ]
+            ],
+            width="stretch",
+            hide_index=True,
+            height=360,
+        )
+    st.dataframe(
+        pd.DataFrame(
+            [{"Step": key, "Count": value} for key, value in scan_stats.items()]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+probability_provider = auto_provider
 value_df, value_stats = analyze_value(outcomes, probability_provider, CONFIG)
 
 st.subheader("2. Value Bets")
 if value_df.empty:
-    st.warning(
-        "No value bets yet. Add true probabilities above, lower Minimum Edge, "
-        "or widen the Polymarket probability range."
-    )
+    if auto_estimate_count == 0:
+        st.warning("No value bets yet because no automated estimates were generated.")
+    else:
+        st.warning(
+            "No value bets passed your filters. Lower Minimum Edge / Minimum Kelly, "
+            "or review model coverage in the table above."
+        )
     with st.expander("Why no value bets?"):
         st.dataframe(
             pd.DataFrame(
                 [{"Step": key, "Count": value} for key, value in value_stats.items()]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 else:
