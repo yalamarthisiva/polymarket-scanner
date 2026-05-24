@@ -73,11 +73,13 @@ class AnalysisConfig:
     bankroll: float
     kelly_fraction: float
     min_edge_pct: float
+    min_edge_pp: float
     min_kelly_pct: float
     min_market_prob: float
     max_market_prob: float
     min_volume: float
     min_liquidity: float
+    max_bet_pct: float
     side_filter: str
     sort_by: str
     sort_ascending: bool
@@ -88,7 +90,10 @@ class AnalysisConfig:
     include_culture: bool
     use_auto_model: bool
     model_blend: float
+    min_event_market_coverage: float
     use_market_consensus_fallback: bool
+    require_actionable_model: bool
+    allow_record_only_value: bool
     skip_politics_auto_model: bool
 
 
@@ -141,6 +146,14 @@ MIN_EDGE_PCT = st.sidebar.number_input(
     step=1.0,
     help="Relative edge: (your true probability - market probability) / market probability.",
 )
+MIN_EDGE_PP = st.sidebar.number_input(
+    "Minimum Edge (percentage points)",
+    value=2.0,
+    min_value=-100.0,
+    max_value=100.0,
+    step=0.5,
+    help="Absolute probability gap. This helps avoid tiny longshot edges that look huge in percent terms.",
+)
 MIN_KELLY = st.sidebar.number_input(
     "Minimum Kelly % of bankroll", value=0.1, min_value=0.0, max_value=100.0, step=0.1
 )
@@ -156,6 +169,14 @@ MIN_VOLUME = st.sidebar.number_input(
 )
 MIN_LIQUIDITY = st.sidebar.number_input(
     "Minimum Liquidity ($, if available)", value=0.0, min_value=0.0, step=10_000.0
+)
+MAX_BET_PCT = st.sidebar.slider(
+    "Max suggested bet % of bankroll",
+    min_value=0.1,
+    max_value=10.0,
+    value=2.5,
+    step=0.1,
+    help="Hard cap on any single suggested bet, even if Kelly math says more.",
 )
 
 SORT_BY = st.sidebar.selectbox(
@@ -185,12 +206,41 @@ MODEL_BLEND = st.sidebar.slider(
         "consensus. Lower is more conservative."
     ),
 )
+MIN_EVENT_MARKET_COVERAGE = st.sidebar.slider(
+    "Minimum event market coverage",
+    min_value=0.25,
+    max_value=1.20,
+    value=0.70,
+    step=0.05,
+    help=(
+        "Only model grouped winner markets when the visible outcomes add up to "
+        "at least this much implied probability. Lower values allow thinner, "
+        "less complete event groups."
+    ),
+)
 USE_MARKET_CONSENSUS_FALLBACK = st.sidebar.checkbox(
     "Fill unsupported markets with no-edge market baseline",
     value=True,
     help=(
         "When no real model exists, use the Polymarket price as the true "
         "probability. This keeps coverage visible without creating fake edge."
+    ),
+)
+REQUIRE_ACTIONABLE_MODEL = st.sidebar.checkbox(
+    "Exclude no-edge baseline from value bets",
+    value=True,
+    help=(
+        "The baseline is only a placeholder for unsupported markets. Leave this "
+        "on so value bets require a real model or record-based estimate."
+    ),
+)
+ALLOW_RECORD_ONLY_VALUE = st.sidebar.checkbox(
+    "Allow record-only value bets",
+    value=False,
+    help=(
+        "Record-only estimates are weak because they use only the win/loss "
+        "record embedded in the market. Leave this off for stricter bankroll "
+        "recommendations."
     ),
 )
 SKIP_POLITICS_AUTO_MODEL = st.sidebar.checkbox(
@@ -225,11 +275,13 @@ CONFIG = AnalysisConfig(
     bankroll=BANKROLL,
     kelly_fraction=KELLY_FRACTION,
     min_edge_pct=MIN_EDGE_PCT,
+    min_edge_pp=MIN_EDGE_PP,
     min_kelly_pct=MIN_KELLY,
     min_market_prob=PROB_RANGE[0],
     max_market_prob=PROB_RANGE[1],
     min_volume=MIN_VOLUME,
     min_liquidity=MIN_LIQUIDITY,
+    max_bet_pct=MAX_BET_PCT,
     side_filter=SIDE_FILTER,
     sort_by=SORT_BY,
     sort_ascending=SORT_ASCENDING,
@@ -240,7 +292,10 @@ CONFIG = AnalysisConfig(
     include_culture=CAT_CULTURE,
     use_auto_model=USE_AUTO_MODEL,
     model_blend=MODEL_BLEND,
+    min_event_market_coverage=MIN_EVENT_MARKET_COVERAGE,
     use_market_consensus_fallback=USE_MARKET_CONSENSUS_FALLBACK,
+    require_actionable_model=REQUIRE_ACTIONABLE_MODEL,
+    allow_record_only_value=ALLOW_RECORD_ONLY_VALUE,
     skip_politics_auto_model=SKIP_POLITICS_AUTO_MODEL,
 )
 
@@ -724,6 +779,48 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
 
 
 # ================== AUTOMATED MODELS ==================
+def event_group_key(outcome: MarketOutcome) -> str:
+    name = outcome.event_name
+
+    if outcome.record:
+        name = re.sub(r"\s+-\s+\d+-\d+(?:-\d+)?\s*$", "", name)
+        name = re.sub(r"\s+-\s+[^-]+$", "", name)
+    elif " - " in name and re.search(
+        r"\b(champion|winner|award|mvp|golden boot)\b", name, flags=re.IGNORECASE
+    ):
+        name = re.sub(r"\s+-\s+[^-]+$", "", name)
+
+    return normalize_name(name)
+
+
+def estimate_quality(estimate: ProbabilityEstimate | None) -> str:
+    if estimate is None:
+        return "Missing"
+    if estimate.source.startswith("auto:market-baseline"):
+        return "Baseline"
+    if estimate.source.startswith("auto:rating:"):
+        return "Model"
+    if estimate.source.startswith("auto:record-in-market"):
+        return "Record"
+    return "Other"
+
+
+def is_actionable_estimate(estimate: ProbabilityEstimate | None) -> bool:
+    return estimate is not None and estimate_quality(estimate) != "Baseline"
+
+
+def estimate_allowed_for_value(
+    estimate: ProbabilityEstimate | None, config: AnalysisConfig
+) -> bool:
+    if not config.require_actionable_model:
+        return estimate is not None
+    if not is_actionable_estimate(estimate):
+        return False
+    if estimate_quality(estimate) == "Record" and not config.allow_record_only_value:
+        return False
+    return True
+
+
 def lookup_team_rating(data: SportsModelData, league: str, participant: str) -> TeamRating | None:
     if not league or not participant:
         return None
@@ -785,6 +882,9 @@ def build_event_model_estimates(
     sports_data: SportsModelData,
     config: AnalysisConfig,
 ) -> dict[str, ProbabilityEstimate]:
+    if sum(outcome.market_prob for outcome in group) < config.min_event_market_coverage:
+        return {}
+
     strengths = {}
     sources = {}
 
@@ -843,7 +943,7 @@ def build_auto_model_provider(
             continue
         if outcome.outcome.strip().upper() != "YES":
             continue
-        groups[outcome.event_name].append(outcome)
+        groups[event_group_key(outcome)].append(outcome)
 
     for group in groups.values():
         by_key.update(build_event_model_estimates(group, sports_data, config))
@@ -873,9 +973,11 @@ def build_estimate_display_df(
                     estimate.true_prob * 100 if estimate is not None else None
                 ),
                 "Model Source": estimate.source if estimate is not None else "no model",
+                "Estimate Quality": estimate_quality(estimate),
                 "Category": outcome.category,
                 "League": outcome.league,
                 "Record": outcome.record,
+                "Event Group": event_group_key(outcome),
                 "Market Key": outcome.key,
             }
         )
@@ -889,6 +991,12 @@ def count_auto_estimates(estimate_df: pd.DataFrame) -> int:
         normalize_probability(value) is not None
         for value in estimate_df["Auto True Probability %"]
     )
+
+
+def count_quality(estimate_df: pd.DataFrame, quality: str) -> int:
+    if estimate_df.empty or "Estimate Quality" not in estimate_df:
+        return 0
+    return int((estimate_df["Estimate Quality"] == quality).sum())
 
 
 # ================== VALUE MATH ==================
@@ -923,7 +1031,10 @@ def analyze_value(
     stats = {
         "Candidate outcomes": len(outcomes),
         "Missing true probability": 0,
+        "Baseline skipped": 0,
+        "Record-only skipped": 0,
         "Filtered by edge": 0,
+        "Filtered by edge pp": 0,
         "Filtered by Kelly": 0,
         "Value rows": 0,
     }
@@ -933,16 +1044,31 @@ def analyze_value(
         if estimate is None:
             stats["Missing true probability"] += 1
             continue
+        if config.require_actionable_model and estimate_quality(estimate) == "Baseline":
+            stats["Baseline skipped"] += 1
+            continue
+        if (
+            config.require_actionable_model
+            and estimate_quality(estimate) == "Record"
+            and not config.allow_record_only_value
+        ):
+            stats["Record-only skipped"] += 1
+            continue
 
         edge = relative_edge(estimate.true_prob, outcome.market_prob)
         edge_pct = edge * 100
+        edge_pp = (estimate.true_prob - outcome.market_prob) * 100
         if edge_pct < config.min_edge_pct:
             stats["Filtered by edge"] += 1
+            continue
+        if edge_pp < config.min_edge_pp:
+            stats["Filtered by edge pp"] += 1
             continue
 
         ev = expected_value_per_dollar(estimate.true_prob, outcome.market_prob)
         full_kelly = full_kelly_fraction(estimate.true_prob, outcome.market_prob)
         adjusted_kelly = full_kelly * config.kelly_fraction
+        capped_kelly = min(adjusted_kelly, config.max_bet_pct / 100)
         kelly_pct = adjusted_kelly * 100
 
         if kelly_pct < config.min_kelly_pct:
@@ -956,13 +1082,16 @@ def analyze_value(
                 "Polymarket Probability": outcome.market_prob,
                 "My True Probability": estimate.true_prob,
                 "Edge %": edge_pct,
-                "Edge pp": (estimate.true_prob - outcome.market_prob) * 100,
+                "Edge pp": edge_pp,
                 "EV %": ev * 100,
                 "EV / $100": ev * 100,
                 "Kelly %": kelly_pct,
-                "Suggested Bet ($)": config.bankroll * adjusted_kelly,
+                "Bet %": capped_kelly * 100,
+                "Suggested Bet ($)": config.bankroll * capped_kelly,
+                "Capped": capped_kelly < adjusted_kelly,
                 "Volume": outcome.volume,
                 "Liquidity": outcome.liquidity,
+                "Source Quality": estimate_quality(estimate),
                 "Source": estimate.source,
                 "Market Key": outcome.key,
             }
@@ -984,6 +1113,58 @@ def analyze_value(
     return df, stats
 
 
+def build_edge_review_df(
+    outcomes: list[MarketOutcome],
+    provider: ProbabilityProvider,
+    config: AnalysisConfig,
+    limit: int = 30,
+) -> pd.DataFrame:
+    rows = []
+
+    for outcome in outcomes:
+        estimate = provider.get(outcome)
+        if not is_actionable_estimate(estimate):
+            continue
+
+        edge = relative_edge(estimate.true_prob, outcome.market_prob)
+        edge_pct = edge * 100
+        edge_pp = (estimate.true_prob - outcome.market_prob) * 100
+        ev = expected_value_per_dollar(estimate.true_prob, outcome.market_prob)
+        full_kelly = full_kelly_fraction(estimate.true_prob, outcome.market_prob)
+        adjusted_kelly = full_kelly * config.kelly_fraction
+
+        blockers = []
+        if estimate_quality(estimate) == "Record" and not config.allow_record_only_value:
+            blockers.append("record-only disabled")
+        if edge_pct < config.min_edge_pct:
+            blockers.append("edge %")
+        if edge_pp < config.min_edge_pp:
+            blockers.append("edge pp")
+        if adjusted_kelly * 100 < config.min_kelly_pct:
+            blockers.append("Kelly")
+
+        rows.append(
+            {
+                "Market": outcome.market_name,
+                "Outcome": outcome.outcome,
+                "Polymarket Probability": outcome.market_prob,
+                "My True Probability": estimate.true_prob,
+                "Edge %": edge_pct,
+                "Edge pp": edge_pp,
+                "EV %": ev * 100,
+                "Kelly %": adjusted_kelly * 100,
+                "Source Quality": estimate_quality(estimate),
+                "Source": estimate.source,
+                "Status": "Passes filters" if not blockers else "Below: " + ", ".join(blockers),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("Edge %", ascending=False).head(limit)
+
+
 # ================== DISPLAY HELPERS ==================
 def format_optional_money(value) -> str:
     if pd.isna(value):
@@ -1002,7 +1183,9 @@ def display_value_table(df: pd.DataFrame):
     display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
     display_df["EV / $100"] = display_df["EV / $100"].map("${:+.2f}".format)
     display_df["Kelly %"] = display_df["Kelly %"].map("{:.2f}%".format)
+    display_df["Bet %"] = display_df["Bet %"].map("{:.2f}%".format)
     display_df["Suggested Bet ($)"] = display_df["Suggested Bet ($)"].map("${:,.0f}".format)
+    display_df["Capped"] = display_df["Capped"].map(lambda value: "Yes" if value else "No")
     display_df["Volume"] = display_df["Volume"].map(format_optional_money)
     display_df["Liquidity"] = display_df["Liquidity"].map(format_optional_money)
 
@@ -1018,14 +1201,50 @@ def display_value_table(df: pd.DataFrame):
                 "EV %",
                 "EV / $100",
                 "Kelly %",
+                "Bet %",
                 "Suggested Bet ($)",
+                "Capped",
                 "Volume",
                 "Liquidity",
+                "Source Quality",
                 "Source",
             ]
         ],
         width="stretch",
         height=620,
+        hide_index=True,
+    )
+
+
+def display_edge_review_table(df: pd.DataFrame):
+    display_df = df.copy()
+    display_df["Polymarket Probability"] = display_df["Polymarket Probability"].map(
+        "{:.1%}".format
+    )
+    display_df["My True Probability"] = display_df["My True Probability"].map("{:.1%}".format)
+    display_df["Edge %"] = display_df["Edge %"].map("{:+.1f}%".format)
+    display_df["Edge pp"] = display_df["Edge pp"].map("{:+.1f}pp".format)
+    display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
+    display_df["Kelly %"] = display_df["Kelly %"].map("{:.2f}%".format)
+
+    st.dataframe(
+        display_df[
+            [
+                "Market",
+                "Outcome",
+                "Polymarket Probability",
+                "My True Probability",
+                "Edge %",
+                "Edge pp",
+                "EV %",
+                "Kelly %",
+                "Source Quality",
+                "Source",
+                "Status",
+            ]
+        ],
+        width="stretch",
+        height=360,
         hide_index=True,
     )
 
@@ -1074,17 +1293,29 @@ sports_model_data = fetch_sports_model_data() if CONFIG.use_auto_model else Spor
 auto_provider = build_auto_model_provider(outcomes, sports_model_data, CONFIG)
 estimate_df = build_estimate_display_df(outcomes, auto_provider)
 auto_estimate_count = count_auto_estimates(estimate_df)
+actionable_estimate_count = (
+    count_quality(estimate_df, "Model")
+    + count_quality(estimate_df, "Record")
+    + count_quality(estimate_df, "Other")
+)
+baseline_estimate_count = count_quality(estimate_df, "Baseline")
 
-estimate_cols = st.columns(4)
+estimate_cols = st.columns(5)
 estimate_cols[0].metric("Candidate outcomes", len(outcomes))
-estimate_cols[1].metric("Automated estimates", auto_estimate_count)
-estimate_cols[2].metric("Still missing", max(0, len(outcomes) - auto_estimate_count))
-estimate_cols[3].metric("Sports rating keys", len(sports_model_data.ratings))
+estimate_cols[1].metric("Non-baseline estimates", actionable_estimate_count)
+estimate_cols[2].metric("Baseline only", baseline_estimate_count)
+estimate_cols[3].metric("Still missing", max(0, len(outcomes) - auto_estimate_count))
+estimate_cols[4].metric("Sports rating keys", len(sports_model_data.ratings))
 
 if auto_estimate_count == 0:
     st.warning(
         "No automated estimates were generated. Turn on automated probabilities, "
         "enable the no-edge market baseline, or widen the market filters."
+    )
+elif actionable_estimate_count == 0:
+    st.warning(
+        "No non-baseline estimates were generated. The app has only "
+        "baseline placeholders for the current filters."
     )
 
 with st.expander("Model coverage and scan stats", expanded=False):
@@ -1105,10 +1336,12 @@ with st.expander("Model coverage and scan stats", expanded=False):
                     "Outcome",
                     "Polymarket Probability",
                     "Auto True Probability %",
+                    "Estimate Quality",
                     "Model Source",
                     "Category",
                     "League",
                     "Record",
+                    "Event Group",
                 ]
             ],
             width="stretch",
@@ -1124,16 +1357,27 @@ with st.expander("Model coverage and scan stats", expanded=False):
     )
 
 probability_provider = auto_provider
+edge_review_df = build_edge_review_df(outcomes, probability_provider, CONFIG)
 value_df, value_stats = analyze_value(outcomes, probability_provider, CONFIG)
 
-st.subheader("2. Value Bets")
+st.subheader("2. Model Edge Review")
+st.caption(
+    "These are the strongest non-baseline model estimates before final value-bet "
+    "filters. Use this table to see whether the model is close to finding an edge."
+)
+if edge_review_df.empty:
+    st.info("No model-backed edges to review for the current filters.")
+else:
+    display_edge_review_table(edge_review_df)
+
+st.subheader("3. Value Bets")
 if value_df.empty:
-    if auto_estimate_count == 0:
-        st.warning("No value bets yet because no automated estimates were generated.")
+    if actionable_estimate_count == 0:
+        st.warning("No value bets yet because no non-baseline estimates were generated.")
     else:
         st.warning(
             "No value bets passed your filters. Lower Minimum Edge / Minimum Kelly, "
-            "or review model coverage in the table above."
+            "or review the model edge table above."
         )
     with st.expander("Why no value bets?"):
         st.dataframe(
