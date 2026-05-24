@@ -33,7 +33,7 @@ st.title("Smart Polymarket Value Tool")
 st.info(
     "Using the Polymarket US public API only. Automated estimates are simple "
     "heuristics from ESPN/MLB standings, FIFA rankings, in-market records, "
-    "and conservative market-consensus fallback."
+    "and a no-edge market baseline for unsupported markets."
 )
 
 
@@ -186,7 +186,12 @@ MODEL_BLEND = st.sidebar.slider(
     ),
 )
 USE_MARKET_CONSENSUS_FALLBACK = st.sidebar.checkbox(
-    "Fill unsupported markets with market consensus", value=True
+    "Fill unsupported markets with no-edge market baseline",
+    value=True,
+    help=(
+        "When no real model exists, use the Polymarket price as the true "
+        "probability. This keeps coverage visible without creating fake edge."
+    ),
 )
 SKIP_POLITICS_AUTO_MODEL = st.sidebar.checkbox(
     "Skip politics automation until polling model exists", value=True
@@ -768,6 +773,13 @@ def de_vigged_market_probs(group: list[MarketOutcome]) -> dict[str, float]:
     return {outcome.key: outcome.market_prob / total_prob for outcome in group}
 
 
+def no_edge_market_baseline(outcome: MarketOutcome) -> ProbabilityEstimate:
+    return ProbabilityEstimate(
+        true_prob=max(0.001, min(0.999, outcome.market_prob)),
+        source="auto:market-baseline (no edge)",
+    )
+
+
 def build_event_model_estimates(
     group: list[MarketOutcome],
     sports_data: SportsModelData,
@@ -838,15 +850,10 @@ def build_auto_model_provider(
 
     if config.use_market_consensus_fallback:
         for group in groups.values():
-            market_probs = de_vigged_market_probs(group)
             for outcome in group:
                 if outcome.key in by_key:
                     continue
-                true_prob = market_probs.get(outcome.key, outcome.market_prob)
-                by_key[outcome.key] = ProbabilityEstimate(
-                    true_prob=max(0.001, min(0.999, true_prob)),
-                    source="auto:market-consensus",
-                )
+                by_key[outcome.key] = no_edge_market_baseline(outcome)
 
     return AutoModelProbabilityProvider(by_key=by_key)
 
@@ -1055,7 +1062,7 @@ st.subheader("1. Automated True Probability Estimates")
 st.caption(
     "The app estimates probabilities automatically from public NBA/NHL/MLB "
     "standings, FIFA men's rankings, and records embedded in markets. "
-    "Unsupported markets use a neutral market-consensus fallback or stay blank, "
+    "Unsupported markets use a no-edge market baseline or stay blank, "
     "depending on your sidebar settings."
 )
 
@@ -1077,7 +1084,7 @@ estimate_cols[3].metric("Sports rating keys", len(sports_model_data.ratings))
 if auto_estimate_count == 0:
     st.warning(
         "No automated estimates were generated. Turn on automated probabilities, "
-        "enable market-consensus fallback, or widen the market filters."
+        "enable the no-edge market baseline, or widen the market filters."
     )
 
 with st.expander("Model coverage and scan stats", expanded=False):
