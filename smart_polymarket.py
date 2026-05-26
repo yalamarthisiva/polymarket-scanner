@@ -28,7 +28,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket Sports Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
-st.info("**Production v3.1** — Clean Model with Sharp Edge Comparison")
+st.info("**Production v3.1** — Clean & Professional")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -46,12 +46,12 @@ ODDS_API_KEY = get_odds_api_key()
 if ODDS_API_KEY:
     st.sidebar.success("✅ Sharp Odds Active")
 else:
-    st.sidebar.warning("Add Odds API Key in secrets for sharp comparison")
+    st.sidebar.info("Add THE_ODDS_API_KEY in .streamlit/secrets.toml for sharp comparison")
 
-MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=3.0, step=0.5)
-MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.3, step=0.1)
-MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=10000, step=5000)
-MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.45, 0.05)
+MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=2.5, step=0.5)
+MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.25, step=0.05)
+MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=8000, step=2000)
+MIN_CONFIDENCE = st.sidebar.slider("Minimum Model Confidence", 0.0, 1.0, 0.4, 0.05)
 
 KELLY_FRACTION = st.sidebar.slider("Kelly Fraction", 0.05, 1.0, 0.25, 0.05)
 
@@ -63,7 +63,7 @@ CAT_ALL = st.sidebar.checkbox("All Categories", value=True)
 CAT_SPORTS = st.sidebar.checkbox("Sports", value=True)
 SIDE_FILTER = st.sidebar.radio("Bet Side", ["Both", "YES only", "NO only"], index=0)
 
-DEBUG_MODE = st.sidebar.checkbox("Debug Info", value=False)
+DEBUG_MODE = st.sidebar.checkbox("Show Debug Info", value=False)
 
 # ================== HELPERS ==================
 def normalize_name(value: str) -> str:
@@ -217,7 +217,7 @@ class TeamRating:
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
 
-# ================== PARSERS ==================
+# ================== PARSERS & MODEL ==================
 def parse_espn_standings(payload: dict, league: str):
     ratings = {}
     for entry in iter_espn_entries(payload):
@@ -290,7 +290,6 @@ def lookup_team_rating(data: SportsModelData, league: str, participant: str):
             return rating
     return None
 
-# ================== MODEL ==================
 def estimate_probabilities(outcomes, sports_data):
     estimates = {}
     groups = defaultdict(list)
@@ -315,7 +314,7 @@ def estimate_probabilities(outcomes, sports_data):
                         true_prob=strengths[o.key] / total,
                         source="Sports Model",
                         is_model=True,
-                        confidence=0.75
+                        confidence=0.72
                     )
     return estimates
 
@@ -426,7 +425,7 @@ col4.metric("Value Bets", len(df))
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("No value bets found with current filters.")
+    st.warning("No value bets found with current filters. The sports betting market is quite efficient right now.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -435,10 +434,10 @@ else:
 if DEBUG_MODE:
     with st.expander("Debug Info"):
         st.write(stats)
-        st.write(f"Sharp Odds Events: {len(sharp_odds)}")
+        st.write(f"Sharp Odds Events Loaded: {len(sharp_odds)}")
 
-st.caption("⚠️ Not financial advice • Model + Sharp Odds Comparison")
+st.caption("⚠️ Not financial advice • Independent Model + Sharp Odds Comparison")
 
-if st.button("Refresh Data"):
+if st.button("🔄 Refresh Data"):
     st.cache_data.clear()
     st.rerun()
