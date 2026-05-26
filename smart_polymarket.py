@@ -57,7 +57,10 @@ st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
 # ================== SECRETS ==================
 def get_odds_api_key():
     try:
-        return st.secrets["THE_ODDS_API_KEY"]
+        # Check if the key exists in Streamlit secrets
+        if "THE_ODDS_API_KEY" in st.secrets:
+            return st.secrets["THE_ODDS_API_KEY"]
+        return None
     except Exception:
         return None
 
@@ -304,7 +307,8 @@ def fetch_sharp_odds(api_key: str | None):
                 if ap: by_team[away] = {"decimal": ap, "home": home, "away": away, "sport": sport}
                 by_event[(home, away)] = {"home_price": hp, "away_price": ap,
                                           "draw_price": dp, "sport": sport}
-        except Exception:
+        except Exception as e:
+            st.sidebar.error(f"Odds API Error: {e}")
             pass
     return by_team, by_event
 
@@ -554,17 +558,31 @@ for market in markets:
     if not (CAT_ALL or (CAT_SPORTS and category == "sports")): continue
     stats["category_pass"] += 1
 
-    # Production Safe Volume parsing fallback logic chain
-    volume_raw = market.get("volumeNum") or market.get("volume") or market.get("liquidityNum") or market.get("liquidity")
-    volume = optional_float(volume_raw)
+    # ========================================================
+    # V5.1 AGGRESSIVE VOLUME EXTRACTION FIX
+    # ========================================================
+    raw_vols = [
+        market.get("volumeNum"), 
+        market.get("volume"), 
+        market.get("volume24hr"),
+        market.get("liquidityNum"), 
+        market.get("liquidity")
+    ]
     
-    current_volume = volume if volume is not None else 0.0
+    valid_vols = []
+    for v in raw_vols:
+        val = optional_float(v)
+        if val is not None:
+            valid_vols.append(val)
+            
+    current_volume = max(valid_vols) if valid_vols else 0.0
+    
     if current_volume < MIN_VOLUME: continue
     stats["volume_pass"] += 1
 
     event_name = clear_market_name(market)
 
-    # Multi-path parsing logic structural fix
+    # Multi-path parsing logic
     tokens             = market.get("tokens", [])
     outcome_names      = market.get("outcomes", [])
     outcome_prices_raw = market.get("outcomePrices", [])
@@ -701,7 +719,7 @@ if df.empty:
         "(currently guards against false positives), or reduce Minimum Volume."
     )
     if not ODDS_API_KEY:
-        st.error("🔑 No THE_ODDS_API_KEY — add it to secrets.toml for sharp odds matching.")
+        st.error("🔑 No THE_ODDS_API_KEY — ensure it is correctly named and formatted in secrets.toml.")
 else:
     df_display = df.sort_values("Edge%", ascending=False).reset_index(drop=True)
 
@@ -752,7 +770,7 @@ if DEBUG_MODE:
                          f"model={est.true_prob if est else 0.0:.2f} "
                          f"src={est.source if est else '—'}")
 
-st.caption("⚠️ Not financial advice • Sharp Odds + Plausibility Guards • v5.0")
+st.caption("⚠️ Not financial advice • Sharp Odds + Plausibility Guards • v5.1")
 
 if st.button("🔄 Refresh Data"):
     st.cache_data.clear()
