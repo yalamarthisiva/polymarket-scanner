@@ -12,7 +12,8 @@ What this version fixes:
 - Optionally refreshes live executable buy prices from the lightweight US /markets/{slug}/bbo endpoint.
 - Avoids treating unsupported/no-model markets as value bets unless you explicitly allow them.
 - Keeps the conservative probability / futures-safety model from v3.
-- Adds final Action / Action Message columns so value rows say BET CANDIDATE, NO TRADE, or DUPLICATE instead of leaving the decision ambiguous.
+- Adds final Action / Action Message columns so value rows say RECOMMENDED BET, SKIP, REVIEW, or DUPLICATE instead of leaving the decision ambiguous.
+- When conflicting value signals appear in the same event, selects the strongest side as the recommendation and keeps the other rows visible as lower-ranked conflicts. This is more useful than blocking every row.
 
 Important: this app is an analysis tool, not financial advice and not an automated trading bot.
 """
@@ -2043,49 +2044,78 @@ def normalize_decision_group_label(value: Any) -> str:
     return text or "unknown"
 
 
+def _recommended_action_for_row(row: pd.Series, config: AnalysisConfig, selected: bool) -> str:
+    """Return the final action for a value row.
+
+    This function is intentionally practical: when multiple sides in the same event show
+    model value, the app selects the strongest row as the recommended bet and marks the
+    rest as lower-ranked conflicts. That keeps all value signals visible without producing
+    a useless all-NO-TRADE result.
+    """
+    if row.get("Futures?") == "Yes":
+        return "RESEARCH ONLY - futures"
+    if not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
+        return "NO TRADE - spread too wide"
+    if not selected:
+        return "SKIP - lower-ranked conflict"
+    if not str(row.get("Price Source") or "").startswith("us_bbo"):
+        return "RECOMMENDED BET - verify live price"
+    return "RECOMMENDED BET"
+
+
 def build_action_message(row: pd.Series, action: str, sides: list[str] | None = None) -> str:
     side = clean_side_label(row)
     buy_prob = float(row.get("Buy Probability") or 0.0)
     fair_prob = float(row.get("Conservative Betting Probability") or 0.0)
     edge_pct = float(row.get("Edge %") or 0.0)
+    edge_pp = float(row.get("Edge pp") or 0.0)
     suggested = float(row.get("Suggested Bet ($)") or 0.0)
     spread = row.get("Live Spread %")
     spread_text = "" if pd.isna(spread) else f" Live spread {float(spread):.1f}%."
 
-    if action.startswith("NO TRADE - conflicting"):
+    if action.startswith("RECOMMENDED BET - verify"):
+        return (
+            f"DO THIS ONLY AFTER LIVE CHECK: buy {side} only if the current live ask is <= {buy_prob:.1%}. "
+            f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp, suggested max ${suggested:,.0f}."
+        )
+    if action == "RECOMMENDED BET":
+        return (
+            f"DO THIS: buy {side} up to {buy_prob:.1%}. "
+            f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp, suggested max ${suggested:,.0f}.{spread_text}"
+        )
+    if action.startswith("SKIP - lower-ranked conflict"):
         side_text = ", ".join(sides or [])
         return (
-            f"NO TRADE: conflicting value signals in the same event ({side_text}). "
-            "Do not bet either side until only one side remains after live-price validation."
+            f"SKIP: {side} also shows model value, but another side in this event ranks stronger. "
+            f"Conflict set: {side_text}. Do not stack both sides from the same event."
         )
     if action.startswith("NO TRADE - spread"):
         return f"NO TRADE: {side} edge exists, but live spread is too wide.{spread_text}"
     if action.startswith("DUPLICATE"):
         return (
-            f"DUPLICATE REVIEW: {side} appears more than once for this event. "
-            "Use the row marked BET CANDIDATE for the same event, not this duplicate row."
+            f"DUPLICATE: {side} appears more than once for this same event/side. "
+            "Use the stronger recommended row, not this duplicate."
         )
     if action.startswith("RESEARCH"):
         return (
-            f"RESEARCH ONLY: {side} shows model value, but this row is not execution-safe. "
+            f"RESEARCH ONLY: {side} shows model value, but this is not execution-safe. "
             f"Buy {buy_prob:.1%}, conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%."
         )
-    if action.startswith("BET CANDIDATE - verify"):
-        return (
-            f"BET CANDIDATE after live check: buy {side} only if current live ask is <= {buy_prob:.1%} "
-            f"and spread is acceptable. Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%, suggested max ${suggested:,.0f}."
-        )
     return (
-        f"BET CANDIDATE: buy {side} up to {buy_prob:.1%}. "
-        f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%, suggested max ${suggested:,.0f}.{spread_text}"
+        f"REVIEW ONLY: {side}. Buy {buy_prob:.1%}, conservative fair {fair_prob:.1%}, "
+        f"edge {edge_pct:+.1f}%, suggested max ${suggested:,.0f}."
     )
 
 
 def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
-    """Keep every value row visible, but label whether it is actually bettable.
+    """Keep every value row visible and select clear recommendations.
 
-    The important behavior: we do NOT collapse value bets to one row. Multiple rows stay in
-    the Value Bets table, while opposite-side conflicts and duplicates are clearly flagged.
+    Behavior:
+    - Every value signal remains visible in the Value Bets table.
+    - For each event/conflict group, the strongest non-futures, acceptable-spread row becomes
+      RECOMMENDED BET or RECOMMENDED BET - verify live price.
+    - Other sides in that same event are SKIP - lower-ranked conflict, not an all-row NO TRADE.
+    - Same-side duplicates are also kept visible but marked DUPLICATE.
     """
     if df.empty:
         return df
@@ -2095,55 +2125,66 @@ def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.Da
         result["Event Group"] = result["Market"].map(normalize_decision_group_label)
     result["Decision Group"] = result["Event Group"].map(normalize_decision_group_label)
     result["Decision Side"] = result.apply(clean_side_label, axis=1)
-    result["Action"] = "BET CANDIDATE"
+    result["Action"] = "REVIEW ONLY"
     result["Action Message"] = ""
 
     for _, group_index in result.groupby("Decision Group", sort=False).groups.items():
-        group = result.loc[list(group_index)]
+        group = result.loc[list(group_index)].copy()
         sides = sorted({str(side).strip() for side in group["Decision Side"] if str(side).strip()})
 
-        # Opposite-side conflict: keep all rows visible, but do not recommend either side.
-        if len(sides) > 1:
-            for idx in group.index:
-                action = "NO TRADE - conflicting sides"
-                result.at[idx, "Action"] = action
-                result.at[idx, "Action Message"] = build_action_message(result.loc[idx], action, sides)
-            continue
+        # Rank by absolute edge first, then relative edge, Kelly, and cheaper buy price.
+        ranked = group.sort_values(
+            ["Edge pp", "Edge %", "Kelly %", "Buy Probability"],
+            ascending=[False, False, False, True],
+            na_position="last",
+        )
 
-        # Same side appears multiple times. Keep them all visible; only the strongest one is actionable.
-        best_idx = group.sort_values(["Edge %", "Kelly %"], ascending=[False, False]).index[0]
-        for idx in group.index:
-            row = result.loc[idx]
-            action = "BET CANDIDATE"
-            if len(group) > 1 and idx != best_idx:
-                action = "DUPLICATE - prefer best row"
-            elif row.get("Futures?") == "Yes":
-                action = "RESEARCH ONLY - futures"
-            elif not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
-                action = "NO TRADE - spread too wide"
-            elif not str(row.get("Price Source") or "").startswith("us_bbo"):
-                action = "BET CANDIDATE - verify live price"
+        # Select the first row that is not blocked by futures/spread.
+        selected_idx = None
+        for idx, row in ranked.iterrows():
+            if row.get("Futures?") == "Yes":
+                continue
+            if not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
+                continue
+            selected_idx = idx
+            break
 
+        # Prevent duplicate same-side recommendations. Only the best row for a side can be selected.
+        best_by_side: dict[str, Any] = {}
+        for idx, row in ranked.iterrows():
+            side = str(row.get("Decision Side") or "").strip()
+            if side and side not in best_by_side:
+                best_by_side[side] = idx
+
+        for idx, row in result.loc[group.index].iterrows():
+            selected = idx == selected_idx
+            side = str(row.get("Decision Side") or "").strip()
+            if selected:
+                action = _recommended_action_for_row(row, config, selected=True)
+            elif side and best_by_side.get(side) != idx:
+                action = "DUPLICATE - prefer stronger same-side row"
+            else:
+                action = _recommended_action_for_row(row, config, selected=False)
             result.at[idx, "Action"] = action
-            result.at[idx, "Action Message"] = build_action_message(row, action, sides)
+            result.at[idx, "Action Message"] = build_action_message(result.loc[idx], action, sides)
 
-    # Put execution-ready rows first, then verification candidates, then blocked/review rows.
     priority = {
-        "BET CANDIDATE": 0,
-        "BET CANDIDATE - verify live price": 1,
-        "DUPLICATE - prefer best row": 2,
-        "RESEARCH ONLY - futures": 3,
-        "NO TRADE - spread too wide": 4,
-        "NO TRADE - conflicting sides": 5,
+        "RECOMMENDED BET": 0,
+        "RECOMMENDED BET - verify live price": 1,
+        "SKIP - lower-ranked conflict": 2,
+        "DUPLICATE - prefer stronger same-side row": 3,
+        "RESEARCH ONLY - futures": 4,
+        "NO TRADE - spread too wide": 5,
+        "REVIEW ONLY": 9,
     }
     result["Action Rank"] = result["Action"].map(priority).fillna(9).astype(int)
-    return result.sort_values(["Action Rank", "Edge %"], ascending=[True, False], na_position="last")
+    return result.sort_values(["Action Rank", "Edge pp", "Edge %"], ascending=[True, False, False], na_position="last")
 
 
 def actionable_bet_mask(df: pd.DataFrame) -> pd.Series:
     if df.empty or "Action" not in df.columns:
         return pd.Series(False, index=df.index)
-    return df["Action"].astype(str).isin(["BET CANDIDATE", "BET CANDIDATE - verify live price"])
+    return df["Action"].astype(str).isin(["RECOMMENDED BET", "RECOMMENDED BET - verify live price"])
 
 
 def display_action_summary(df: pd.DataFrame) -> None:
@@ -2152,10 +2193,35 @@ def display_action_summary(df: pd.DataFrame) -> None:
 
     bet_mask = actionable_bet_mask(df)
     if bet_mask.any():
-        st.success(f"Clear result: {int(bet_mask.sum())} bet candidate(s). Rows below still show all value signals, including duplicates/conflicts.")
+        st.success(
+            f"Clear result: {int(bet_mask.sum())} recommended bet(s). "
+            "The table below still shows all value signals, including skipped conflicts and duplicates."
+        )
+        st.markdown("**Recommended bets to consider now**")
+        rec_df = df.loc[bet_mask, [
+            "Action",
+            "Action Message",
+            "Market",
+            "Outcome",
+            "Participant",
+            "Buy Probability",
+            "Conservative Betting Probability",
+            "Edge %",
+            "Edge pp",
+            "Kelly %",
+            "Suggested Bet ($)",
+        ]].copy()
+        rec_df["Buy Probability"] = rec_df["Buy Probability"].map("{:.1%}".format)
+        rec_df["Conservative Betting Probability"] = rec_df["Conservative Betting Probability"].map("{:.1%}".format)
+        rec_df["Edge %"] = rec_df["Edge %"].map("{:+.1f}%".format)
+        rec_df["Edge pp"] = rec_df["Edge pp"].map("{:+.1f}pp".format)
+        rec_df["Kelly %"] = rec_df["Kelly %"].map("{:.2f}%".format)
+        rec_df["Suggested Bet ($)"] = rec_df["Suggested Bet ($)"].map("${:,.0f}".format)
+        st.dataframe(rec_df, width="stretch", height=220, hide_index=True)
     else:
-        st.warning("Clear result: no execution-safe bet right now. Value signals are shown below, but every row is blocked or review-only.")
+        st.warning("Clear result: no recommended bet right now. Value signals are shown below, but every row is blocked or review-only.")
 
+    st.markdown("**All value signals with action labels**")
     summary_df = df[[
         "Action",
         "Action Message",
@@ -2165,15 +2231,17 @@ def display_action_summary(df: pd.DataFrame) -> None:
         "Buy Probability",
         "Conservative Betting Probability",
         "Edge %",
+        "Edge pp",
         "Kelly %",
         "Suggested Bet ($)",
     ]].copy()
     summary_df["Buy Probability"] = summary_df["Buy Probability"].map("{:.1%}".format)
     summary_df["Conservative Betting Probability"] = summary_df["Conservative Betting Probability"].map("{:.1%}".format)
     summary_df["Edge %"] = summary_df["Edge %"].map("{:+.1f}%".format)
+    summary_df["Edge pp"] = summary_df["Edge pp"].map("{:+.1f}pp".format)
     summary_df["Kelly %"] = summary_df["Kelly %"].map("{:.2f}%".format)
     summary_df["Suggested Bet ($)"] = summary_df["Suggested Bet ($)"].map("${:,.0f}".format)
-    st.dataframe(summary_df, width="stretch", height=260, hide_index=True)
+    st.dataframe(summary_df, width="stretch", height=300, hide_index=True)
 
 
 # ================== DISPLAY HELPERS ==================
@@ -2445,7 +2513,7 @@ if edge_review_df.empty:
 else:
     display_edge_review_table(edge_review_df)
 
-st.subheader("3. Value Bets — Conservative / Execution-Aware")
+st.subheader("3. Value Bets — Recommended + All Signals")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
 if not value_df.empty:
     value_df = add_value_action_messages(value_df, CONFIG)
@@ -2461,10 +2529,10 @@ else:
     candidate_df = value_df.loc[bet_mask]
     value_cols = st.columns(5)
     value_cols[0].metric("Value rows shown", len(value_df))
-    value_cols[1].metric("Bet candidates", len(candidate_df))
-    value_cols[2].metric("Best candidate edge", "N/A" if candidate_df.empty else f"{candidate_df['Edge %'].max():.1f}%")
-    value_cols[3].metric("Best candidate Kelly", "N/A" if candidate_df.empty else f"{candidate_df['Kelly %'].max():.2f}%")
-    value_cols[4].metric("Suggested on candidates", f"${candidate_df['Suggested Bet ($)'].sum():,.0f}")
+    value_cols[1].metric("Recommended bets", len(candidate_df))
+    value_cols[2].metric("Best recommended edge", "N/A" if candidate_df.empty else f"{candidate_df['Edge %'].max():.1f}%")
+    value_cols[3].metric("Best recommended Kelly", "N/A" if candidate_df.empty else f"{candidate_df['Kelly %'].max():.2f}%")
+    value_cols[4].metric("Suggested on recommended", f"${candidate_df['Suggested Bet ($)'].sum():,.0f}")
     display_action_summary(value_df)
     display_value_table(value_df)
     csv = value_df.to_csv(index=False).encode()
