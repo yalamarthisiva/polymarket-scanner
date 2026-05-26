@@ -28,7 +28,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v2.8** — Lenient Value Detection")
+st.info("**Production v2.9** — Ultra Lenient Mode for Testing")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -48,18 +48,18 @@ if ODDS_API_KEY:
 else:
     ODDS_API_KEY = st.sidebar.text_input("The Odds API Key", type="password")
 
-RELAXED_MODE = st.sidebar.checkbox("🟢 Relaxed Mode (Recommended)", value=True)
+ULTRA_LENIENT = st.sidebar.checkbox("🔥 Ultra Lenient Mode (Show almost everything)", value=True)
 
-if RELAXED_MODE:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.8, step=0.2)
+if ULTRA_LENIENT:
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.5, step=0.1)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.05, step=0.05)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=500, step=500)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.25, 0.05)
+else:
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=1.5, step=0.2)
     MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.1, step=0.05)
     MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=1000, step=1000)
     MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.3, 0.05)
-else:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=3.0, step=0.5)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.3, step=0.1)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=20000, step=5000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.45, 0.05)
 
 KELLY_FRACTION = st.sidebar.slider("Kelly Fraction", 0.05, 1.0, 0.25, 0.05)
 
@@ -138,14 +138,14 @@ def fetch_sports_model():
             ratings.update(parse_espn_standings(r.json(), league))
         except: pass
 
-    try:  # MLB
+    try:
         r = requests.get("https://statsapi.mlb.com/api/v1/standings",
                         params={"leagueId": "103,104", "season": datetime.now().year}, timeout=15)
         r.raise_for_status()
         ratings.update(parse_mlb_standings(r.json()))
     except: pass
 
-    try:  # FIFA
+    try:
         r = requests.get(FIFA_MENS_RANKINGS_URL, params={"gender": "male"}, timeout=15)
         r.raise_for_status()
         ratings.update(parse_fifa_rankings(r.json()))
@@ -179,7 +179,7 @@ def fetch_sharp_odds():
         except: pass
     return sharp
 
-# ================== DOMAIN MODELS ==================
+# ================== DOMAIN MODELS & PARSERS (same) ==================
 @dataclass(frozen=True)
 class MarketOutcome:
     key: str
@@ -226,7 +226,6 @@ class TeamRating:
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
 
-# ================== PARSERS & MODEL ==================
 def parse_espn_standings(payload: dict, league: str):
     ratings = {}
     for entry in iter_espn_entries(payload):
@@ -338,7 +337,7 @@ def calc_no_complement(estimates, outcomes):
                 result[o.key] = ProbabilityEstimate(1 - yes.true_prob, f"Complement ({yes.source})", yes.is_model, yes.confidence * 0.95)
     return result
 
-# ================== MAIN LOGIC ==================
+# ================== MAIN ==================
 markets = fetch_polymarket()
 sports_data = fetch_sports_model() if USE_AUTO_MODEL else SportsModelData()
 sharp_odds = fetch_sharp_odds()
@@ -389,7 +388,6 @@ stats["final"] = len(outcomes)
 estimates = estimate_probabilities(outcomes, sports_data)
 estimates = calc_no_complement(estimates, outcomes)
 
-# Value bets
 value_rows = []
 for o in outcomes:
     est = estimates.get(o.key)
@@ -432,7 +430,7 @@ col4.metric("Value Bets", len(df))
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("No value bets yet. Try lowering Edge% and Kelly% further.")
+    st.warning("Still no value bets. The market is very efficient right now.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -441,10 +439,10 @@ else:
 if DEBUG_MODE:
     with st.expander("Debug Info"):
         st.write(stats)
-        st.write(f"Sharp Odds Events: {len(sharp_odds)}")
-        st.write(f"Total Outcomes Analyzed: {len(outcomes)}")
+        st.write(f"Outcomes Analyzed: {len(outcomes)}")
+        st.write(f"Sharp Odds Loaded: {len(sharp_odds)}")
 
-st.caption("⚠️ Not financial advice • Model + The Odds API Active")
+st.caption("⚠️ Not financial advice")
 
 if AUTO_REFRESH:
     time.sleep(300)
