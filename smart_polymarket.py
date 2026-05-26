@@ -154,6 +154,11 @@ class AnalysisConfig:
     futures_min_confidence: float
     futures_max_shift_pp: float
     require_live_prices_for_value: bool
+    recommendation_mode: str
+    max_recommended_bets: int
+    max_recommended_bets_per_event: int
+    allow_correlated_same_event_bets: bool
+    max_event_exposure_pct: float
     use_live_clob_prices: bool
     live_clob_max_tokens: int
     fetch_pages: int
@@ -405,6 +410,48 @@ REQUIRE_LIVE_PRICES_FOR_VALUE = st.sidebar.checkbox(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Recommendation Mode")
+RECOMMENDATION_MODE = st.sidebar.selectbox(
+    "Recommendation mode",
+    options=[
+        "Conservative: one strongest per event",
+        "Aggressive: multiple signals portfolio",
+    ],
+    index=1,
+    help=(
+        "Conservative picks only one row per event. Aggressive can recommend multiple value signals, "
+        "including correlated same-event picks, with per-event exposure caps."
+    ),
+)
+MAX_RECOMMENDED_BETS = st.sidebar.slider(
+    "Max recommended bets shown",
+    min_value=1,
+    max_value=20,
+    value=5,
+    step=1,
+)
+ALLOW_CORRELATED_SAME_EVENT_BETS = st.sidebar.checkbox(
+    "Allow correlated same-event bets",
+    value=True,
+    help="Aggressive mode only. Allows multiple picks from the same event, but caps total exposure.",
+)
+MAX_RECOMMENDED_BETS_PER_EVENT = st.sidebar.slider(
+    "Max recommended bets per event",
+    min_value=1,
+    max_value=5,
+    value=2,
+    step=1,
+)
+MAX_EVENT_EXPOSURE_PCT = st.sidebar.slider(
+    "Max total exposure per event % of bankroll",
+    min_value=0.25,
+    max_value=10.0,
+    value=3.0,
+    step=0.25,
+    help="Caps combined stake across all picks from the same event in aggressive mode.",
+)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Categories")
 CAT_ALL = st.sidebar.checkbox("Show All", value=True)
 CAT_SPORTS = st.sidebar.checkbox("Sports", value=True)
@@ -465,6 +512,11 @@ CONFIG = AnalysisConfig(
     futures_min_confidence=FUTURES_MIN_CONFIDENCE,
     futures_max_shift_pp=FUTURES_MAX_SHIFT_PP,
     require_live_prices_for_value=REQUIRE_LIVE_PRICES_FOR_VALUE,
+    recommendation_mode=RECOMMENDATION_MODE,
+    max_recommended_bets=MAX_RECOMMENDED_BETS,
+    max_recommended_bets_per_event=MAX_RECOMMENDED_BETS_PER_EVENT,
+    allow_correlated_same_event_bets=ALLOW_CORRELATED_SAME_EVENT_BETS,
+    max_event_exposure_pct=MAX_EVENT_EXPOSURE_PCT,
     use_live_clob_prices=USE_LIVE_CLOB_PRICES,
     live_clob_max_tokens=LIVE_CLOB_MAX_TOKENS,
     fetch_pages=FETCH_PAGES,
@@ -2063,16 +2115,51 @@ def _recommended_action_for_row(row: pd.Series, config: AnalysisConfig, selected
     return "RECOMMENDED BET"
 
 
+def action_stake(row: pd.Series) -> float:
+    portfolio_value = row.get("Portfolio Bet ($)")
+    try:
+        if portfolio_value is not None and not pd.isna(portfolio_value) and float(portfolio_value) > 0:
+            return float(portfolio_value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(row.get("Suggested Bet ($)") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def build_action_message(row: pd.Series, action: str, sides: list[str] | None = None) -> str:
     side = clean_side_label(row)
     buy_prob = float(row.get("Buy Probability") or 0.0)
     fair_prob = float(row.get("Conservative Betting Probability") or 0.0)
     edge_pct = float(row.get("Edge %") or 0.0)
     edge_pp = float(row.get("Edge pp") or 0.0)
-    suggested = float(row.get("Suggested Bet ($)") or 0.0)
+    suggested = action_stake(row)
     spread = row.get("Live Spread %")
     spread_text = "" if pd.isna(spread) else f" Live spread {float(spread):.1f}%."
 
+    if action.startswith("AGGRESSIVE SAME-EVENT BET - verify"):
+        return (
+            f"AGGRESSIVE SAME-EVENT PICK: buy {side} only after live check and only if ask <= {buy_prob:.1%}. "
+            f"This is correlated with another pick from the same event. Conservative fair {fair_prob:.1%}, "
+            f"edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp, portfolio stake ${suggested:,.0f}."
+        )
+    if action.startswith("AGGRESSIVE SAME-EVENT BET"):
+        return (
+            f"AGGRESSIVE SAME-EVENT PICK: buy {side} up to {buy_prob:.1%}. "
+            f"This is correlated exposure, so use the capped portfolio stake ${suggested:,.0f}. "
+            f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp.{spread_text}"
+        )
+    if action.startswith("AGGRESSIVE BET - verify"):
+        return (
+            f"AGGRESSIVE PICK: buy {side} only after live check and only if ask <= {buy_prob:.1%}. "
+            f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp, portfolio stake ${suggested:,.0f}."
+        )
+    if action == "AGGRESSIVE BET":
+        return (
+            f"AGGRESSIVE PICK: buy {side} up to {buy_prob:.1%}. "
+            f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp, portfolio stake ${suggested:,.0f}.{spread_text}"
+        )
     if action.startswith("RECOMMENDED BET - verify"):
         return (
             f"DO THIS ONLY AFTER LIVE CHECK: buy {side} only if the current live ask is <= {buy_prob:.1%}. "
@@ -2087,14 +2174,25 @@ def build_action_message(row: pd.Series, action: str, sides: list[str] | None = 
         side_text = ", ".join(sides or [])
         return (
             f"SKIP: {side} also shows model value, but another side in this event ranks stronger. "
-            f"Conflict set: {side_text}. Do not stack both sides from the same event."
+            f"Conflict set: {side_text}. Do not stack both sides in conservative mode."
         )
+    if action.startswith("SKIP - same-event limit"):
+        return (
+            f"SKIP: {side} is a value signal, but the event already reached your aggressive per-event pick limit. "
+            "Increase Max recommended bets per event only if you intentionally want more correlated exposure."
+        )
+    if action.startswith("SKIP - event exposure cap"):
+        return (
+            f"SKIP: {side} is a value signal, but this event already reached your bankroll exposure cap."
+        )
+    if action.startswith("SKIP - portfolio limit"):
+        return f"SKIP: {side} is a value signal, but the overall aggressive portfolio already reached the max number of picks."
     if action.startswith("NO TRADE - spread"):
         return f"NO TRADE: {side} edge exists, but live spread is too wide.{spread_text}"
     if action.startswith("DUPLICATE"):
         return (
             f"DUPLICATE: {side} appears more than once for this same event/side. "
-            "Use the stronger recommended row, not this duplicate."
+            "Use the stronger row, not this duplicate."
         )
     if action.startswith("RESEARCH"):
         return (
@@ -2107,19 +2205,7 @@ def build_action_message(row: pd.Series, action: str, sides: list[str] | None = 
     )
 
 
-def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
-    """Keep every value row visible and select clear recommendations.
-
-    Behavior:
-    - Every value signal remains visible in the Value Bets table.
-    - For each event/conflict group, the strongest non-futures, acceptable-spread row becomes
-      RECOMMENDED BET or RECOMMENDED BET - verify live price.
-    - Other sides in that same event are SKIP - lower-ranked conflict, not an all-row NO TRADE.
-    - Same-side duplicates are also kept visible but marked DUPLICATE.
-    """
-    if df.empty:
-        return df
-
+def _prepare_decision_columns(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     if "Event Group" not in result.columns:
         result["Event Group"] = result["Market"].map(normalize_decision_group_label)
@@ -2127,19 +2213,28 @@ def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.Da
     result["Decision Side"] = result.apply(clean_side_label, axis=1)
     result["Action"] = "REVIEW ONLY"
     result["Action Message"] = ""
+    if "Portfolio Bet ($)" not in result.columns:
+        result["Portfolio Bet ($)"] = 0.0
+    return result
+
+
+def add_conservative_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
+    """Conservative mode: keep all rows visible, but recommend only one row per event."""
+    if df.empty:
+        return df
+
+    result = _prepare_decision_columns(df)
 
     for _, group_index in result.groupby("Decision Group", sort=False).groups.items():
         group = result.loc[list(group_index)].copy()
         sides = sorted({str(side).strip() for side in group["Decision Side"] if str(side).strip()})
 
-        # Rank by absolute edge first, then relative edge, Kelly, and cheaper buy price.
         ranked = group.sort_values(
             ["Edge pp", "Edge %", "Kelly %", "Buy Probability"],
             ascending=[False, False, False, True],
             na_position="last",
         )
 
-        # Select the first row that is not blocked by futures/spread.
         selected_idx = None
         for idx, row in ranked.iterrows():
             if row.get("Futures?") == "Yes":
@@ -2149,7 +2244,6 @@ def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.Da
             selected_idx = idx
             break
 
-        # Prevent duplicate same-side recommendations. Only the best row for a side can be selected.
         best_by_side: dict[str, Any] = {}
         for idx, row in ranked.iterrows():
             side = str(row.get("Decision Side") or "").strip()
@@ -2161,6 +2255,7 @@ def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.Da
             side = str(row.get("Decision Side") or "").strip()
             if selected:
                 action = _recommended_action_for_row(row, config, selected=True)
+                result.at[idx, "Portfolio Bet ($)"] = float(row.get("Suggested Bet ($)") or 0.0)
             elif side and best_by_side.get(side) != idx:
                 action = "DUPLICATE - prefer stronger same-side row"
             else:
@@ -2181,10 +2276,121 @@ def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.Da
     return result.sort_values(["Action Rank", "Edge pp", "Edge %"], ascending=[True, False, False], na_position="last")
 
 
+def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
+    """Aggressive mode: recommend several top value signals with correlation/exposure caps.
+
+    This is intentionally more permissive than conservative mode. It can recommend more than
+    one pick from the same event if allowed, but it labels those picks as correlated and caps
+    the total stake for that event.
+    """
+    if df.empty:
+        return df
+
+    result = _prepare_decision_columns(df)
+    result["Portfolio Bet ($)"] = 0.0
+
+    ranked = result.sort_values(
+        ["Edge pp", "Edge %", "Kelly %", "Buy Probability"],
+        ascending=[False, False, False, True],
+        na_position="last",
+    )
+
+    # Keep only the strongest duplicate row for the same event + same side.
+    best_by_group_side: dict[tuple[str, str], Any] = {}
+    for idx, row in ranked.iterrows():
+        key = (str(row.get("Decision Group") or ""), str(row.get("Decision Side") or ""))
+        if key not in best_by_group_side:
+            best_by_group_side[key] = idx
+
+    recommended_count = 0
+    per_event_count: dict[str, int] = defaultdict(int)
+    per_event_exposure: dict[str, float] = defaultdict(float)
+    max_per_event = config.max_recommended_bets_per_event if config.allow_correlated_same_event_bets else 1
+    event_cap = max(0.0, config.bankroll * config.max_event_exposure_pct / 100.0)
+
+    for idx, row in ranked.iterrows():
+        group = str(row.get("Decision Group") or "unknown")
+        side = str(row.get("Decision Side") or "").strip()
+        duplicate_key = (group, side)
+        sides = sorted({
+            str(s).strip()
+            for s in result.loc[result["Decision Group"] == group, "Decision Side"]
+            if str(s).strip()
+        })
+
+        if row.get("Futures?") == "Yes":
+            action = "RESEARCH ONLY - futures"
+        elif not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
+            action = "NO TRADE - spread too wide"
+        elif best_by_group_side.get(duplicate_key) != idx:
+            action = "DUPLICATE - prefer stronger same-side row"
+        elif recommended_count >= config.max_recommended_bets:
+            action = "SKIP - portfolio limit"
+        elif per_event_count[group] >= max_per_event:
+            action = "SKIP - same-event limit"
+        else:
+            remaining_event_cap = event_cap - per_event_exposure[group]
+            if remaining_event_cap <= 0:
+                action = "SKIP - event exposure cap"
+            else:
+                raw_stake = float(row.get("Suggested Bet ($)") or 0.0)
+                stake = min(raw_stake, remaining_event_cap)
+                if stake <= 0:
+                    action = "SKIP - event exposure cap"
+                else:
+                    already_has_event_pick = per_event_count[group] > 0
+                    needs_live_check = not str(row.get("Price Source") or "").startswith("us_bbo")
+                    if already_has_event_pick:
+                        action = "AGGRESSIVE SAME-EVENT BET - verify live price" if needs_live_check else "AGGRESSIVE SAME-EVENT BET"
+                    else:
+                        action = "AGGRESSIVE BET - verify live price" if needs_live_check else "AGGRESSIVE BET"
+                    result.at[idx, "Portfolio Bet ($)"] = stake
+                    recommended_count += 1
+                    per_event_count[group] += 1
+                    per_event_exposure[group] += stake
+
+        result.at[idx, "Action"] = action
+        result.at[idx, "Action Message"] = build_action_message(result.loc[idx], action, sides)
+
+    priority = {
+        "AGGRESSIVE BET": 0,
+        "AGGRESSIVE BET - verify live price": 1,
+        "AGGRESSIVE SAME-EVENT BET": 2,
+        "AGGRESSIVE SAME-EVENT BET - verify live price": 3,
+        "RECOMMENDED BET": 4,
+        "RECOMMENDED BET - verify live price": 5,
+        "SKIP - same-event limit": 6,
+        "SKIP - event exposure cap": 7,
+        "SKIP - portfolio limit": 8,
+        "DUPLICATE - prefer stronger same-side row": 9,
+        "RESEARCH ONLY - futures": 10,
+        "NO TRADE - spread too wide": 11,
+        "REVIEW ONLY": 19,
+    }
+    result["Action Rank"] = result["Action"].map(priority).fillna(19).astype(int)
+    return result.sort_values(["Action Rank", "Edge pp", "Edge %"], ascending=[True, False, False], na_position="last")
+
+
+def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
+    """Route value rows through conservative or aggressive recommendation logic."""
+    if df.empty:
+        return df
+    if str(config.recommendation_mode).startswith("Aggressive"):
+        return add_aggressive_action_messages(df, config)
+    return add_conservative_action_messages(df, config)
+
+
 def actionable_bet_mask(df: pd.DataFrame) -> pd.Series:
     if df.empty or "Action" not in df.columns:
         return pd.Series(False, index=df.index)
-    return df["Action"].astype(str).isin(["RECOMMENDED BET", "RECOMMENDED BET - verify live price"])
+    return df["Action"].astype(str).isin([
+        "RECOMMENDED BET",
+        "RECOMMENDED BET - verify live price",
+        "AGGRESSIVE BET",
+        "AGGRESSIVE BET - verify live price",
+        "AGGRESSIVE SAME-EVENT BET",
+        "AGGRESSIVE SAME-EVENT BET - verify live price",
+    ])
 
 
 def display_action_summary(df: pd.DataFrame) -> None:
@@ -2193,12 +2399,13 @@ def display_action_summary(df: pd.DataFrame) -> None:
 
     bet_mask = actionable_bet_mask(df)
     if bet_mask.any():
+        mode_text = "aggressive portfolio pick(s)" if df["Action"].astype(str).str.startswith("AGGRESSIVE").any() else "recommended bet(s)"
         st.success(
-            f"Clear result: {int(bet_mask.sum())} recommended bet(s). "
-            "The table below still shows all value signals, including skipped conflicts and duplicates."
+            f"Clear result: {int(bet_mask.sum())} {mode_text}. "
+            "The table below still shows all value signals, including skipped conflicts, duplicates, and capped rows."
         )
-        st.markdown("**Recommended bets to consider now**")
-        rec_df = df.loc[bet_mask, [
+        st.markdown("**Recommended / aggressive bets to consider now**")
+        rec_columns = [
             "Action",
             "Action Message",
             "Market",
@@ -2209,20 +2416,25 @@ def display_action_summary(df: pd.DataFrame) -> None:
             "Edge %",
             "Edge pp",
             "Kelly %",
-            "Suggested Bet ($)",
-        ]].copy()
+        ]
+        if "Portfolio Bet ($)" in df.columns:
+            rec_columns.append("Portfolio Bet ($)")
+        rec_columns.append("Suggested Bet ($)")
+        rec_df = df.loc[bet_mask, rec_columns].copy()
         rec_df["Buy Probability"] = rec_df["Buy Probability"].map("{:.1%}".format)
         rec_df["Conservative Betting Probability"] = rec_df["Conservative Betting Probability"].map("{:.1%}".format)
         rec_df["Edge %"] = rec_df["Edge %"].map("{:+.1f}%".format)
         rec_df["Edge pp"] = rec_df["Edge pp"].map("{:+.1f}pp".format)
         rec_df["Kelly %"] = rec_df["Kelly %"].map("{:.2f}%".format)
+        if "Portfolio Bet ($)" in rec_df.columns:
+            rec_df["Portfolio Bet ($)"] = rec_df["Portfolio Bet ($)"].map("${:,.0f}".format)
         rec_df["Suggested Bet ($)"] = rec_df["Suggested Bet ($)"].map("${:,.0f}".format)
-        st.dataframe(rec_df, width="stretch", height=220, hide_index=True)
+        st.dataframe(rec_df, width="stretch", height=max(220, 80 + 42 * len(rec_df)), hide_index=True)
     else:
         st.warning("Clear result: no recommended bet right now. Value signals are shown below, but every row is blocked or review-only.")
 
     st.markdown("**All value signals with action labels**")
-    summary_df = df[[
+    summary_columns = [
         "Action",
         "Action Message",
         "Market",
@@ -2233,15 +2445,20 @@ def display_action_summary(df: pd.DataFrame) -> None:
         "Edge %",
         "Edge pp",
         "Kelly %",
-        "Suggested Bet ($)",
-    ]].copy()
+    ]
+    if "Portfolio Bet ($)" in df.columns:
+        summary_columns.append("Portfolio Bet ($)")
+    summary_columns.append("Suggested Bet ($)")
+    summary_df = df[summary_columns].copy()
     summary_df["Buy Probability"] = summary_df["Buy Probability"].map("{:.1%}".format)
     summary_df["Conservative Betting Probability"] = summary_df["Conservative Betting Probability"].map("{:.1%}".format)
     summary_df["Edge %"] = summary_df["Edge %"].map("{:+.1f}%".format)
     summary_df["Edge pp"] = summary_df["Edge pp"].map("{:+.1f}pp".format)
     summary_df["Kelly %"] = summary_df["Kelly %"].map("{:.2f}%".format)
+    if "Portfolio Bet ($)" in summary_df.columns:
+        summary_df["Portfolio Bet ($)"] = summary_df["Portfolio Bet ($)"].map("${:,.0f}".format)
     summary_df["Suggested Bet ($)"] = summary_df["Suggested Bet ($)"].map("${:,.0f}".format)
-    st.dataframe(summary_df, width="stretch", height=300, hide_index=True)
+    st.dataframe(summary_df, width="stretch", height=360, hide_index=True)
 
 
 # ================== DISPLAY HELPERS ==================
@@ -2275,6 +2492,8 @@ def display_value_table(df: pd.DataFrame) -> None:
     display_df["EV / $100"] = display_df["EV / $100"].map("${:+.2f}".format)
     display_df["Kelly %"] = display_df["Kelly %"].map("{:.2f}%".format)
     display_df["Bet %"] = display_df["Bet %"].map("{:.2f}%".format)
+    if "Portfolio Bet ($)" in display_df:
+        display_df["Portfolio Bet ($)"] = display_df["Portfolio Bet ($)"].map("${:,.0f}".format)
     display_df["Suggested Bet ($)"] = display_df["Suggested Bet ($)"].map("${:,.0f}".format)
     display_df["Capped"] = display_df["Capped"].map(lambda value: "Yes" if value else "No")
     display_df["Volume"] = display_df["Volume"].map(format_optional_money)
@@ -2310,6 +2529,7 @@ def display_value_table(df: pd.DataFrame) -> None:
                 "EV / $100",
                 "Kelly %",
                 "Bet %",
+                "Portfolio Bet ($)",
                 "Suggested Bet ($)",
                 "Capped",
                 "Volume",
@@ -2513,7 +2733,7 @@ if edge_review_df.empty:
 else:
     display_edge_review_table(edge_review_df)
 
-st.subheader("3. Value Bets — Recommended + All Signals")
+st.subheader("3. Value Bets — Aggressive Portfolio + All Signals")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
 if not value_df.empty:
     value_df = add_value_action_messages(value_df, CONFIG)
@@ -2529,17 +2749,18 @@ else:
     candidate_df = value_df.loc[bet_mask]
     value_cols = st.columns(5)
     value_cols[0].metric("Value rows shown", len(value_df))
-    value_cols[1].metric("Recommended bets", len(candidate_df))
-    value_cols[2].metric("Best recommended edge", "N/A" if candidate_df.empty else f"{candidate_df['Edge %'].max():.1f}%")
-    value_cols[3].metric("Best recommended Kelly", "N/A" if candidate_df.empty else f"{candidate_df['Kelly %'].max():.2f}%")
-    value_cols[4].metric("Suggested on recommended", f"${candidate_df['Suggested Bet ($)'].sum():,.0f}")
+    stake_col = "Portfolio Bet ($)" if "Portfolio Bet ($)" in candidate_df.columns else "Suggested Bet ($)"
+    value_cols[1].metric("Recommended picks", len(candidate_df))
+    value_cols[2].metric("Best pick edge", "N/A" if candidate_df.empty else f"{candidate_df['Edge %'].max():.1f}%")
+    value_cols[3].metric("Best pick Kelly", "N/A" if candidate_df.empty else f"{candidate_df['Kelly %'].max():.2f}%")
+    value_cols[4].metric("Portfolio stake", f"${candidate_df[stake_col].sum():,.0f}" if not candidate_df.empty else "$0")
     display_action_summary(value_df)
     display_value_table(value_df)
     csv = value_df.to_csv(index=False).encode()
     st.download_button("Download value bets CSV", csv, "polymarket_value_bets.csv", "text/csv")
 
 st.caption(
-    "Not financial advice. A positive edge in this app only means the selected heuristic model is above the market price. "
+    "Not financial advice. Aggressive mode increases correlated exposure and can lose faster. A positive edge in this app only means the selected heuristic model is above the market price. "
     "Before risking money, validate the probability model, market rules, liquidity, spread, fees, and legal/compliance constraints."
 )
 
