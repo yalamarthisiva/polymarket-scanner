@@ -27,26 +27,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. DATA PIPELINE (LIVE INGESTION)
+# 2. FIXED DATA PIPELINE
 # ==========================================
 class LiveDataPipeline:
     @staticmethod
     def fetch_live_polymarket() -> List[Dict[str, Any]]:
         url = "https://gamma-api.polymarket.com/markets"
-        params = {"closed": "false", "active": "true", "limit": "150", "core": "true"}
+        params = {"closed": "false", "active": "true", "limit": "250", "core": "true"}
         normalized = []
         try:
-            res = requests.get(url, params=params, timeout=8)
+            res = requests.get(url, params=params, timeout=10)
             if res.status_code == 200:
                 for m in res.json():
-                    prices = m.get("outcomePrices")
-                    if not prices: continue
-                    # Handle JSON-encoded strings safely
-                    if isinstance(prices, str):
-                        try: prices = json.loads(prices)
-                        except: continue
+                    prices_raw = m.get("outcomePrices")
+                    # FIX: Handle double-encoded JSON strings to prevent errors
+                    prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
                     
-                    if len(prices) >= 1:
+                    if prices and isinstance(prices, list):
                         normalized.append({
                             "title": m.get("title", ""),
                             "curPrice": float(prices[0]),
@@ -57,15 +54,8 @@ class LiveDataPipeline:
             st.sidebar.error(f"Pipeline API Error: {e}")
         return []
 
-    @staticmethod
-    def fetch_sharp_lines(api_key: str) -> List[Dict[str, Any]]:
-        if not api_key: return []
-        aggregated = []
-        # Add your sports segments here
-        return aggregated
-
 # ==========================================
-# 3. ANALYTICAL ENGINE
+# 3. RISK CALCULATION ENGINE
 # ==========================================
 def calculate_risk_bounds(price: float) -> Tuple[str, str]:
     if price < 0.30: return "High Risk", "Asymmetric Speculative"
@@ -77,27 +67,28 @@ def calculate_risk_bounds(price: float) -> Tuple[str, str]:
 # ==========================================
 def main():
     st.title("⚡ QUANTUM TRADING SCOUT")
-    st.markdown("---")
-
-    # Sidebar
+    st.sidebar.header("Risk Constraints")
     bankroll = st.sidebar.number_input("Capital Pool ($)", value=1000.0)
     
-    # Ingestion
-    pm_raw = LiveDataPipeline.fetch_live_polymarket()
+    # Execution
+    raw_data = LiveDataPipeline.fetch_live_polymarket()
     
-    if pm_raw:
-        df = pd.DataFrame(pm_raw)
+    if raw_data:
+        df = pd.DataFrame(raw_data)
         
-        # Apply Logic
+        # Apply your engine logic
         df[['risk_range', 'prob_range']] = df['curPrice'].apply(
             lambda x: pd.Series(calculate_risk_bounds(x))
         )
         
-        # Display Data
-        st.dataframe(df, use_container_width=True)
+        # UI Metrics
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"<div class='metric-container-box'><div class='metric-big-value'>{len(df)}</div><div class='metric-sub-label'>Contracts Pulled</div></div>", unsafe_allow_html=True)
         
+        st.subheader("Live Processing Matrix")
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.warning("Waiting for data stream...")
+        st.warning("Fetching data stream...")
 
 if __name__ == "__main__":
     main()
