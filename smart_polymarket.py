@@ -37,7 +37,7 @@ CLOB_BASE_URL = "https://clob.polymarket.com"
 FIFA_MENS_RANKINGS_URL = "https://api.fifa.com/api/v3/rankings"
 
 REQUEST_HEADERS = {
-    "User-Agent": "smart-polymarket-value-tool/1.1",
+    "User-Agent": "smart-polymarket-value-tool/1.2-fast-safe",
     "Accept": "application/json",
 }
 
@@ -289,13 +289,13 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Live Market Data")
 USE_LIVE_CLOB_PRICES = st.sidebar.checkbox(
     "Use live CLOB orderbook buy prices",
-    value=True,
-    help="Uses public orderbook asks when token IDs are available. Slower, but closer to executable pricing.",
+    value=False,
+    help="OFF by default so Streamlit Cloud does not hang on many public CLOB calls. Turn on only after the Gamma-only table loads.",
 )
 LIVE_CLOB_MAX_TOKENS = st.sidebar.slider(
-    "Max live CLOB tokens per refresh", min_value=10, max_value=250, value=80, step=10
+    "Max live CLOB tokens per refresh", min_value=5, max_value=100, value=25, step=5
 )
-FETCH_PAGES = st.sidebar.slider("Gamma pages to fetch", min_value=1, max_value=10, value=5, step=1)
+FETCH_PAGES = st.sidebar.slider("Gamma pages to fetch", min_value=1, max_value=10, value=2, step=1)
 PAGE_SIZE = st.sidebar.slider("Gamma page size", min_value=25, max_value=100, value=100, step=25)
 
 st.sidebar.markdown("---")
@@ -593,7 +593,7 @@ def fetch_order_book(token_id: str) -> dict[str, Any] | None:
             f"{CLOB_BASE_URL}/book",
             params={"token_id": token_id},
             headers=REQUEST_HEADERS,
-            timeout=8,
+            timeout=2.5,
         )
         response.raise_for_status()
         payload = response.json()
@@ -1928,8 +1928,15 @@ if manual_refresh:
     st.cache_data.clear()
     st.session_state.last_refresh = time.time()
 
+status_box = st.empty()
+status_box.caption(
+    "Loading Gamma markets first. Live CLOB orderbook pricing is OFF by default to avoid Streamlit Cloud hanging; enable it after the table loads."
+)
+
 markets, fetch_stats = fetch_market_data(CONFIG)
+status_box.caption(f"Fetched {len(markets)} Gamma markets. Parsing outcomes and model coverage...")
 outcomes, scan_stats = build_market_outcomes(markets, CONFIG)
+status_box.empty()
 
 with col_time:
     st.caption(
