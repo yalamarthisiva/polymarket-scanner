@@ -381,10 +381,13 @@ def lookup_team_rating(data: SportsModelData, league: str, participant: str):
     if not participant: return None
     norm = normalize_name(participant)
     league = league.lower()
+    
     if (league, norm) in data.ratings:
         return data.ratings[(league, norm)]
+        
+    # Global Name Mismatch Fallback
     for (l, n), rating in data.ratings.items():
-        if l == league and (norm in n or n in norm):
+        if norm == n or norm in n or n in norm:
             return rating
     return None
 
@@ -418,48 +421,60 @@ def match_sharp_odds_for_outcome(
         return None
 
     title_norm = " " + normalize_name(outcome.event_name) + " "
-    is_yes = outcome.outcome.upper() == "YES"
     part_norm = normalize_name(outcome.participant) if outcome.participant else ""
+    outcome_norm = normalize_name(outcome.outcome)
 
-    # Dynamic Matcher Loop
-    for (home_key, away_key), event in sharp_by_event.items():
-        home_words = home_key.split()
-        away_words = away_key.split()
-        home_last = home_words[-1] if home_words else ""
-        away_last = away_words[-1] if away_words else ""
+    matched_event = None
+    target_team_norm = ""
+    
+    # Unified Team Asset Resolver
+    if part_norm in sharp_by_team:
+        matched_event = sharp_by_team[part_norm]
+        target_team_norm = part_norm
+    elif outcome_norm in sharp_by_team:
+        matched_event = sharp_by_team[outcome_norm]
+        target_team_norm = outcome_norm
+    else:
+        for team_key, event in sharp_by_team.items():
+            if f" {team_key} " in title_norm or (len(team_key) > 4 and team_key in title_norm):
+                matched_event = event
+                target_team_norm = team_key
+                break
+
+    if not matched_event:
+        return None
+
+    home_key = normalize_name(matched_event.get("home"))
+    away_key = normalize_name(matched_event.get("away"))
+    prices = [matched_event.get("home_price"), matched_event.get("away_price")]
+    if None in prices: 
+        return None
         
-        # Match cross-references
-        has_home = home_key in title_norm or (home_last and f" {home_last} " in title_norm)
-        has_away = away_key in title_norm or (away_last and f" {away_last} " in title_norm)
-        
-        if has_home and has_away:
-            prices = [event.get("home_price"), event.get("away_price")]
-            if None in prices: continue
-            fair_probs = vig_free_prob(prices) # [home_prob, away_prob]
-            
-            # Identify targeted asset
-            if part_norm and (part_norm in home_key or home_last in part_norm):
-                true_prob = fair_probs[0] if is_yes else fair_probs[1]
-            elif part_norm and (part_norm in away_key or away_last in part_norm):
-                true_prob = fair_probs[1] if is_yes else fair_probs[0]
-            else:
-                # Fallback to positional appearance order
-                h_idx = title_norm.find(home_last) if home_last else -1
-                a_idx = title_norm.find(away_last) if away_last else -1
-                is_home_first = h_idx < a_idx if (h_idx != -1 and a_idx != -1) else True
-                
-                if is_home_first:
-                    true_prob = fair_probs[0] if is_yes else fair_probs[1]
-                else:
-                    true_prob = fair_probs[1] if is_yes else fair_probs[0]
-                    
-            true_prob = max(0.01, min(0.99, true_prob))
-            if is_plausible_match(outcome.market_prob, true_prob):
-                return ProbabilityEstimate(
-                    true_prob=true_prob, 
-                    source=f"Sharp ({event['home']} vs {event['away']})", 
-                    is_model=False, confidence=0.85
-                )
+    fair_probs = vig_free_prob(prices)
+    is_yes = outcome.outcome.upper() == "YES"
+
+    is_home = (target_team_norm == home_key or home_key in target_team_norm or target_team_norm in home_key)
+    
+    if not target_team_norm or outcome.outcome.upper() in ["YES", "NO"]:
+        h_idx = title_norm.find(home_key.split()[-1]) if home_key else -1
+        a_idx = title_norm.find(away_key.split()[-1]) if away_key else -1
+        if h_idx != -1 and a_idx != -1:
+            is_home = h_idx < a_idx
+        else:
+            is_home = True
+
+    if is_home:
+        true_prob = fair_probs[0] if is_yes else fair_probs[1]
+    else:
+        true_prob = fair_probs[1] if is_yes else fair_probs[0]
+
+    true_prob = max(0.01, min(0.99, true_prob))
+    if is_plausible_match(outcome.market_prob, true_prob):
+        return ProbabilityEstimate(
+            true_prob=true_prob, 
+            source=f"Sharp ({matched_event['home']} vs {matched_event['away']})", 
+            is_model=False, confidence=0.85
+        )
     return None
 
 
@@ -511,7 +526,6 @@ for market in markets:
     if not is_open_market(market): continue
     stats["open"] += 1
 
-    # Safe Tag Parsing Matrix
     tag_list = market.get("tags", [])
     tag_words = []
     if isinstance(tag_list, list):
@@ -527,13 +541,22 @@ for market in markets:
     league_field = str(market.get("league") or "").lower()
     title_or_q = (str(market.get("question", "")) + " " + str(market.get("title", ""))).lower()
     
+    # Sports Router Matrix Mapping
+    detected_league = "sports"
+    for lg in ["nba", "nfl", "mlb", "nhl"]:
+        if lg in tag_words or lg in league_field or lg in sport_field or lg in title_or_q:
+            detected_league = lg
+            break
+    if detected_league == "sports" and any(x in title_or_q for x in ["soccer", "premier league", "champions league", "fifa", "world cup"]):
+        detected_league = "fifawc"
+
     is_sports_market = (
         category == "sports" or
         sport_field != "" or
         league_field != "" or
+        detected_league != "sports" or
         "sports" in tag_words or
-        any(s in league_field for s in ["nba", "nfl", "mlb", "nhl", "soccer", "ufc", "tennis", "fifa"]) or
-        any(s in title_or_q for s in ["nba", "nfl", "mlb", "nhl", "ufc", "champions league", "premier league", "world cup", "soccer", "basketball", "baseball"])
+        any(s in title_or_q for s in ["ufc", "tennis", "basketball", "baseball", "football", "hockey"])
     )
 
     if not CAT_ALL and CAT_SPORTS and not is_sports_market: 
@@ -541,7 +564,6 @@ for market in markets:
             
     stats["category_pass"] += 1
 
-    # Dynamic Variable Harvesting (Bypasses API field shifts)
     valid_vols = []
     for k, v in market.items():
         if "volume" in k.lower() or "liquidity" in k.lower():
@@ -555,7 +577,6 @@ for market in markets:
     event_name = clear_market_name(market)
     pairs = []
     
-    # Format parsing matrices
     outcomes_list = market.get("outcomes")
     prices_list = market.get("outcomePrices")
     if isinstance(prices_list, str):
@@ -589,7 +610,6 @@ for market in markets:
         else:
             participant = outcome_text
 
-        league_val = league_field if league_field else (sport_field if sport_field else "sports")
         slug = market.get("slug") or market.get("id") or market.get("conditionId","")
 
         outcomes.append(MarketOutcome(
@@ -597,7 +617,7 @@ for market in markets:
             market_id=str(market.get("id") or market.get("conditionId","")),
             slug=str(slug), category=category, event_name=event_name,
             market_name=event_name, outcome=outcome_text, participant=participant,
-            league=league_val, record="", market_prob=price, volume=current_volume,
+            league=detected_league, record="", market_prob=price, volume=current_volume,
             liquidity=optional_float(market.get("liquidityNum") or market.get("liquidity")),
         ))
 
@@ -688,4 +708,4 @@ if DEBUG_MODE:
                 est = combined.get(o.key)
                 st.write(f"Title: {o.event_name} | Price: {o.market_prob} | Target: {o.participant} | Match: {est.source if est else 'None'}")
 
-st.caption("⚠️ Automated scanning array • Sharp Odds Execution Layout • v5.3")
+st.caption("⚠️ Automated scanning array • Sharp Odds Execution Layout • v5.4")
