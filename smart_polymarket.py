@@ -225,7 +225,7 @@ class AutoModelProbabilityProvider:
 
 # ================== UI ==================
 st.set_page_config(page_title="Smart Polymarket Value Tool", layout="wide")
-st.title("Smart Polymarket Value Tool")
+st.title("Smart Polymarket Value Tool — US Broader Portfolio")
 st.info(
     "US-only mode: uses Polymarket US public API at gateway.polymarket.us for discovery "
     "and optional /markets/{slug}/bbo live prices. Probability estimates are conservative heuristics. "
@@ -309,7 +309,7 @@ USE_LIVE_CLOB_PRICES = st.sidebar.checkbox(
 LIVE_CLOB_MAX_TOKENS = st.sidebar.slider(
     "Max live US BBO markets per refresh", min_value=5, max_value=100, value=25, step=5
 )
-FETCH_PAGES = st.sidebar.slider("US gateway pages to fetch", min_value=1, max_value=20, value=6, step=1)
+FETCH_PAGES = st.sidebar.slider("US gateway pages to fetch", min_value=1, max_value=20, value=12, step=1)
 PAGE_SIZE = st.sidebar.slider("US gateway page size", min_value=25, max_value=100, value=100, step=25)
 
 st.sidebar.markdown("---")
@@ -427,7 +427,7 @@ MAX_RECOMMENDED_BETS = st.sidebar.slider(
     "Max recommended bets shown",
     min_value=1,
     max_value=20,
-    value=10,
+    value=12,
     step=1,
 )
 ALLOW_CORRELATED_SAME_EVENT_BETS = st.sidebar.checkbox(
@@ -1542,21 +1542,46 @@ def event_group_key(outcome: MarketOutcome) -> str:
     return normalize_name(name)
 
 
+def is_scheduled_match_market(outcome: MarketOutcome) -> bool:
+    """Return True for a single game/match winner market.
+
+    Important: tournament words like "World Cup" can appear in a normal scheduled
+    match market. Those should not be treated as long-horizon futures.
+    """
+    text = f"{outcome.market_name} {outcome.event_name} {outcome.outcome}".lower()
+    scheduled_patterns = [
+        r"\bmatch scheduled\b",
+        r"\bgame scheduled\b",
+        r"\bwill .+ win against .+",
+        r"\bwill .+ beat .+",
+        r"\bvs\.?\b",
+        r"\bv\.?\b",
+        r"\bagainst\b",
+        r"\bfull game\b",
+        r"\bmoneyline\b",
+    ]
+    return any(re.search(pattern, text) for pattern in scheduled_patterns)
+
+
 def is_futures_market(outcome: MarketOutcome) -> bool:
     text = f"{outcome.market_name} {outcome.event_name} {outcome.outcome}".lower()
+
+    # Do not classify a specific scheduled game/match as a futures market simply
+    # because the tournament name contains words like "World Cup" or the year.
+    if is_scheduled_match_market(outcome):
+        return False
+
     futures_patterns = [
-        r"\bworld series\b",
-        r"\bstanley cup\b",
-        r"\bworld cup\b",
+        r"\bto win (?:the )?(?:world series|stanley cup|world cup|championship|conference|division)\b",
+        r"\bwin (?:the )?(?:world series|stanley cup|world cup|championship|conference|division)\b",
         r"\bchampion(?:ship)?\b",
-        r"\bconference\b",
-        r"\bdivision\b",
+        r"\bconference winner\b",
+        r"\bdivision winner\b",
         r"\bseason\b",
         r"\bplayoffs?\b",
         r"\bmvp\b",
         r"\baward\b",
-        r"\b202[6-9]\b",
-        r"\b203[0-9]\b",
+        r"\bgolden boot\b",
     ]
     return any(re.search(pattern, text) for pattern in futures_patterns)
 
@@ -2746,7 +2771,7 @@ else:
     display_edge_review_table(edge_review_df)
 
 st.subheader("3. Value Bets — Directional Aggressive Portfolio + All Signals")
-st.caption("Aggressive mode now tries to build a multi-bet portfolio across independent events. It will not recommend opposite teams from the same matchup as simultaneous bets.")
+st.caption("Broader mode scans more US markets and treats scheduled match winners separately from long-horizon futures. It still will not recommend opposite teams from the same matchup as simultaneous bets.")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
 if not value_df.empty:
     value_df = add_value_action_messages(value_df, CONFIG)
