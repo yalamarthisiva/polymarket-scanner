@@ -163,6 +163,9 @@ class AnalysisConfig:
     live_clob_max_tokens: int
     fetch_pages: int
     page_size: int
+    enable_universal_queue: bool
+    max_universal_queue_rows: int
+    universal_small_stake_pct: float
 
 
 @dataclass(frozen=True)
@@ -225,7 +228,7 @@ class AutoModelProbabilityProvider:
 
 # ================== UI ==================
 st.set_page_config(page_title="Smart Polymarket Value Tool", layout="wide")
-st.title("Smart Polymarket Value Tool — US Broader Portfolio")
+st.title("Smart Polymarket Value Tool — Universal US Scanner")
 st.info(
     "US-only mode: uses Polymarket US public API at gateway.polymarket.us for discovery "
     "and optional /markets/{slug}/bbo live prices. Probability estimates are conservative heuristics. "
@@ -452,6 +455,28 @@ MAX_EVENT_EXPOSURE_PCT = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Universal US Scanner")
+ENABLE_UNIVERSAL_QUEUE = st.sidebar.checkbox(
+    "Show all-US market action queue",
+    value=True,
+    help=(
+        "Adds a separate ranked queue from every scanned Polymarket US category. "
+        "Rows without a true-probability model are labeled MARKET-ONLY / REVIEW, not model-backed value bets."
+    ),
+)
+MAX_UNIVERSAL_QUEUE_ROWS = st.sidebar.slider(
+    "Max universal queue rows", min_value=5, max_value=50, value=25, step=5
+)
+UNIVERSAL_SMALL_STAKE_PCT = st.sidebar.slider(
+    "Market-only small test stake %",
+    min_value=0.05,
+    max_value=2.0,
+    value=0.25,
+    step=0.05,
+    help="Suggested cap for market-only review rows that do not have a real true-probability model.",
+)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Categories")
 CAT_ALL = st.sidebar.checkbox("Show All", value=True)
 CAT_SPORTS = st.sidebar.checkbox("Sports", value=True)
@@ -521,6 +546,9 @@ CONFIG = AnalysisConfig(
     live_clob_max_tokens=LIVE_CLOB_MAX_TOKENS,
     fetch_pages=FETCH_PAGES,
     page_size=PAGE_SIZE,
+    enable_universal_queue=ENABLE_UNIVERSAL_QUEUE,
+    max_universal_queue_rows=MAX_UNIVERSAL_QUEUE_ROWS,
+    universal_small_stake_pct=UNIVERSAL_SMALL_STAKE_PCT,
 )
 
 
@@ -2498,6 +2526,198 @@ def display_action_summary(df: pd.DataFrame) -> None:
     st.dataframe(summary_df, width="stretch", height=360, hide_index=True)
 
 
+
+# ================== UNIVERSAL US ACTION QUEUE ==================
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def universal_market_score(outcome: MarketOutcome, estimate: ProbabilityEstimate | None) -> float:
+    """Rank every US market for review without pretending every market has a true-prob model."""
+    price = max(0.001, min(0.999, outcome.market_prob))
+    volume = safe_float(outcome.volume)
+    liquidity = safe_float(outcome.liquidity)
+    score = 0.0
+
+    # Prefer tradable middle probabilities over extreme longshots unless there is a real model.
+    if 0.20 <= price <= 0.80:
+        score += 25.0
+    elif 0.08 <= price <= 0.92:
+        score += 10.0
+    else:
+        score -= 8.0
+
+    # Higher liquidity/volume matters for execution.
+    score += min(25.0, math.log10(volume + 1.0) * 4.0)
+    score += min(25.0, math.log10(liquidity + 1.0) * 4.0)
+
+    # Live spread, when available, is one of the best execution-quality filters.
+    if outcome.live_spread_pct is not None:
+        spread = max(0.0, outcome.live_spread_pct)
+        if spread <= 5:
+            score += 25.0
+        elif spread <= 10:
+            score += 15.0
+        elif spread <= 25:
+            score += 5.0
+        else:
+            score -= 25.0
+    else:
+        # Do not punish too heavily when live BBO is off; just avoid calling it execution-ready.
+        score += 3.0
+
+    if estimate is not None and estimate_quality(estimate) in {"Model", "Record", "Other"}:
+        score += 35.0 * max(0.2, estimate.confidence)
+    if is_futures_market(outcome):
+        score -= 12.0
+    if outcome.category == "sports":
+        score += 8.0
+    if outcome.price_source.startswith("us_bbo"):
+        score += 8.0
+    return score
+
+
+def build_universal_us_action_queue(
+    outcomes: list[MarketOutcome],
+    provider: ProbabilityProvider,
+    value_df: pd.DataFrame,
+    config: AnalysisConfig,
+) -> pd.DataFrame:
+    """Create a broad ranked queue from every scanned Polymarket US market.
+
+    Model-backed value rows stay in the normal Value Bets table. This queue fills the user's
+    need to see what to look at across the whole US app while clearly marking unsupported
+    rows as market-only review items.
+    """
+    rows: list[dict[str, Any]] = []
+    selected_value_keys: set[str] = set()
+    if not value_df.empty and "Market Key" in value_df.columns and "Action" in value_df.columns:
+        selected_value_keys = set(value_df.loc[actionable_bet_mask(value_df), "Market Key"].astype(str))
+
+    for outcome in outcomes:
+        side = outcome.outcome.strip().upper()
+        if side == "NO":
+            # In the universal queue, avoid mirror NO rows because they clutter the app.
+            continue
+        estimate = provider.get(outcome)
+        quality = estimate_quality(estimate)
+        score = universal_market_score(outcome, estimate)
+        market_only_stake = config.bankroll * config.universal_small_stake_pct / 100.0
+        is_model_pick = outcome.key in selected_value_keys
+        is_model_supported = estimate is not None and quality in {"Model", "Record", "Other"}
+
+        if is_model_pick:
+            action = "MODEL-BACKED PICK"
+            action_message = "This is already selected in Value Bets. Verify live price/rules before executing."
+            stake = None
+        elif is_model_supported:
+            action = "MODEL-BACKED WATCHLIST"
+            action_message = "Model exists, but it did not pass final value/recommendation filters. Watch price movement or relax filters intentionally."
+            stake = 0.0
+        else:
+            action = "MARKET-ONLY REVIEW"
+            action_message = (
+                "No true-probability model for this market yet. Review manually in the Polymarket US app; "
+                f"if you still want action, keep it tiny: max ${market_only_stake:,.0f}."
+            )
+            stake = market_only_stake
+
+        if outcome.live_spread_pct is not None and outcome.live_spread_pct > config.max_live_spread_pct:
+            action = "SKIP - SPREAD TOO WIDE"
+            action_message = "Live spread is wider than your setting. Do not execute unless spread tightens."
+            stake = 0.0
+        if is_futures_market(outcome) and not config.allow_futures_value_bets and not is_model_pick:
+            action = "RESEARCH ONLY - FUTURES"
+            action_message = "Long-horizon/futures market. Needs deeper domain/news model before betting."
+            stake = 0.0
+
+        rows.append({
+            "Action": action,
+            "Action Message": action_message,
+            "Market": outcome.market_name,
+            "Outcome": outcome.outcome,
+            "Participant": outcome.participant,
+            "Category": outcome.category,
+            "Buy Probability": outcome.market_prob,
+            "Volume": outcome.volume,
+            "Liquidity": outcome.liquidity,
+            "Live Bid": outcome.live_bid,
+            "Live Ask": outcome.live_ask,
+            "Live Spread %": outcome.live_spread_pct,
+            "Price Source": outcome.price_source,
+            "Model Quality": quality,
+            "Model Confidence": estimate.confidence if estimate else 0.0,
+            "Universal Score": score,
+            "Small Test Stake ($)": stake,
+            "Event Group": event_group_key(outcome),
+            "Market Key": outcome.key,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # One row per event first, to give a broad all-US queue instead of repeating the same matchup.
+    df = df.sort_values("Universal Score", ascending=False)
+    broad_rows = []
+    seen_events: set[str] = set()
+    for _, row in df.iterrows():
+        event = str(row.get("Event Group") or "")
+        if event in seen_events:
+            continue
+        broad_rows.append(row)
+        seen_events.add(event)
+        if len(broad_rows) >= config.max_universal_queue_rows:
+            break
+    result = pd.DataFrame(broad_rows)
+    return result.sort_values("Universal Score", ascending=False)
+
+
+def display_universal_us_action_queue(df: pd.DataFrame, config: AnalysisConfig) -> None:
+    if df.empty:
+        st.info("Universal US Action Queue is empty for the current filters.")
+        return
+
+    display_df = df.copy()
+    display_df["Buy Probability"] = display_df["Buy Probability"].map("{:.1%}".format)
+    display_df["Volume"] = display_df["Volume"].map(format_optional_money)
+    display_df["Liquidity"] = display_df["Liquidity"].map(format_optional_money)
+    display_df["Live Bid"] = display_df["Live Bid"].map(lambda v: "N/A" if pd.isna(v) else f"{float(v):.3f}")
+    display_df["Live Ask"] = display_df["Live Ask"].map(lambda v: "N/A" if pd.isna(v) else f"{float(v):.3f}")
+    display_df["Live Spread %"] = display_df["Live Spread %"].map(lambda v: format_optional_pct(v, 1))
+    display_df["Model Confidence"] = display_df["Model Confidence"].map(lambda v: f"{float(v):.2f}")
+    display_df["Universal Score"] = display_df["Universal Score"].map(lambda v: f"{float(v):.1f}")
+    display_df["Small Test Stake ($)"] = display_df["Small Test Stake ($)"].map(lambda v: "N/A" if pd.isna(v) else f"${float(v):,.0f}")
+
+    st.dataframe(
+        display_df[[
+            "Action",
+            "Action Message",
+            "Market",
+            "Outcome",
+            "Participant",
+            "Category",
+            "Buy Probability",
+            "Volume",
+            "Liquidity",
+            "Live Bid",
+            "Live Ask",
+            "Live Spread %",
+            "Model Quality",
+            "Model Confidence",
+            "Universal Score",
+            "Small Test Stake ($)",
+        ]],
+        width="stretch",
+        height=max(360, min(850, 110 + 38 * len(display_df))),
+        hide_index=True,
+    )
+
 # ================== DISPLAY HELPERS ==================
 def format_optional_money(value: Any) -> str:
     if pd.isna(value):
@@ -2797,9 +3017,31 @@ else:
     csv = value_df.to_csv(index=False).encode()
     st.download_button("Download value bets CSV", csv, "polymarket_value_bets.csv", "text/csv")
 
+if CONFIG.enable_universal_queue:
+    st.subheader("4. Universal US Action Queue — All Categories")
+    st.caption(
+        "This scans every current Polymarket US outcome returned by the US gateway. "
+        "Rows marked MARKET-ONLY REVIEW are not true-probability value bets; they are broad app-level opportunities to inspect manually."
+    )
+    universal_df = build_universal_us_action_queue(outcomes, auto_provider, value_df if 'value_df' in locals() else pd.DataFrame(), CONFIG)
+    universal_cols = st.columns(4)
+    universal_cols[0].metric("Universal rows", len(universal_df))
+    if not universal_df.empty:
+        universal_cols[1].metric("Model-backed in queue", int(universal_df["Action"].astype(str).str.contains("MODEL").sum()))
+        universal_cols[2].metric("Market-only reviews", int((universal_df["Action"] == "MARKET-ONLY REVIEW").sum()))
+        universal_cols[3].metric("Small stake cap", f"${CONFIG.bankroll * CONFIG.universal_small_stake_pct / 100.0:,.0f}")
+    else:
+        universal_cols[1].metric("Model-backed in queue", 0)
+        universal_cols[2].metric("Market-only reviews", 0)
+        universal_cols[3].metric("Small stake cap", f"${CONFIG.bankroll * CONFIG.universal_small_stake_pct / 100.0:,.0f}")
+    display_universal_us_action_queue(universal_df, CONFIG)
+    if not universal_df.empty:
+        universal_csv = universal_df.to_csv(index=False).encode()
+        st.download_button("Download universal US action queue CSV", universal_csv, "polymarket_universal_us_action_queue.csv", "text/csv")
+
 st.caption(
     "Not financial advice. Aggressive mode increases exposure and can lose faster. This version blocks opposite-side same-event recommendations by default. A positive edge in this app only means the selected heuristic model is above the market price. "
-    "Before risking money, validate the probability model, market rules, liquidity, spread, fees, and legal/compliance constraints."
+    "Before risking money, validate the probability model, market rules, liquidity, spread, fees, and legal/compliance constraints. Universal market-only rows are not true-probability bets."
 )
 
 if AUTO_REFRESH:
