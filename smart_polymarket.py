@@ -103,6 +103,11 @@ class MarketOutcome:
 class ProbabilityEstimate:
     true_prob: float
     source: str
+    model_probability: float | None = None
+    market_prior: float | None = None
+    confidence: float = 0.0
+    effective_model_weight: float = 0.0
+    max_shift_pp: float = 0.0
 
 
 class ProbabilityProvider(Protocol):
@@ -134,6 +139,8 @@ class AnalysisConfig:
     include_finance: bool
     use_auto_model: bool
     model_blend: float
+    min_model_confidence: float
+    max_model_shift_pp: float
     min_event_market_coverage: float
     use_market_consensus_fallback: bool
     require_actionable_model: bool
@@ -166,11 +173,33 @@ class TeamRating:
     league: str
     rating: float
     source: str
+    games: float = 0.0
+    wins: float | None = None
+    losses: float | None = None
+    draws_or_ot: float = 0.0
+    confidence: float = 0.35
 
 
 @dataclass(frozen=True)
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating]
+
+
+@dataclass(frozen=True)
+class RecordSignal:
+    rating: float
+    games: float
+    wins: float
+    losses: float
+    draws_or_ot: float
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ModelSignal:
+    strength: float
+    source: str
+    confidence: float
 
 
 @dataclass
@@ -278,7 +307,23 @@ MODEL_BLEND = st.sidebar.slider(
     max_value=1.0,
     value=0.25,
     step=0.05,
-    help="How much to trust the simple model versus de-vigged market consensus.",
+    help="Maximum model weight before confidence shrinkage. Actual weight is lower when data quality is weak.",
+)
+MIN_MODEL_CONFIDENCE = st.sidebar.slider(
+    "Minimum model confidence",
+    min_value=0.00,
+    max_value=1.00,
+    value=0.18,
+    step=0.01,
+    help="Filters weak estimates. Low-confidence records/partial matchups will remain baseline instead of creating fake edge.",
+)
+MAX_MODEL_SHIFT_PP = st.sidebar.slider(
+    "Max model move from market (pp)",
+    min_value=1.0,
+    max_value=25.0,
+    value=8.0,
+    step=0.5,
+    help="Safety cap: after blending, the estimated true probability cannot move more than this many points from the de-vigged market prior.",
 )
 MIN_EVENT_MARKET_COVERAGE = st.sidebar.slider(
     "Minimum event market coverage",
@@ -313,7 +358,12 @@ CAT_FINANCE = st.sidebar.checkbox("Finance / Economy", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Bet Side")
-SIDE_FILTER = st.sidebar.radio("Show bets", options=["YES only", "NO only", "Both"], index=0)
+SIDE_FILTER = st.sidebar.radio(
+    "Show bets",
+    options=["YES only", "NO only", "Both"],
+    index=2,
+    help="Use Both for sports/multi-outcome markets where outcomes are team/player names instead of YES/NO.",
+)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Data")
@@ -344,6 +394,8 @@ CONFIG = AnalysisConfig(
     include_finance=CAT_FINANCE,
     use_auto_model=USE_AUTO_MODEL,
     model_blend=MODEL_BLEND,
+    min_model_confidence=MIN_MODEL_CONFIDENCE,
+    max_model_shift_pp=MAX_MODEL_SHIFT_PP,
     min_event_market_coverage=MIN_EVENT_MARKET_COVERAGE,
     use_market_consensus_fallback=USE_MARKET_CONSENSUS_FALLBACK,
     require_actionable_model=REQUIRE_ACTIONABLE_MODEL,
@@ -681,25 +733,117 @@ def iter_espn_standing_entries(node: dict):
             yield from iter_espn_standing_entries(child)
 
 
+def stat_float(stats: dict, *names: str) -> float | None:
+    for name in names:
+        value = optional_float(stats.get(name))
+        if value is not None:
+            return value
+    return None
+
+
+def bayesian_rate(
+    wins: float,
+    losses: float,
+    draws_or_ot: float = 0.0,
+    prior_rate: float = 0.50,
+    prior_games: float = 12.0,
+) -> float:
+    games = wins + losses + draws_or_ot
+    if games <= 0:
+        return prior_rate
+    effective_wins = wins + 0.5 * draws_or_ot
+    return max(0.01, min(0.99, (effective_wins + prior_rate * prior_games) / (games + prior_games)))
+
+
+def games_confidence(games: float, full_season_games: float) -> float:
+    if games <= 0:
+        return 0.0
+    # Smoothly rises with sample size. Even a full season is not perfect predictive signal.
+    return max(0.05, min(0.85, games / max(full_season_games, 1)))
+
+
+def league_full_season_games(league: str) -> float:
+    return {"nba": 82.0, "nhl": 82.0, "mlb": 162.0, "fifawc": 12.0}.get(league.lower(), 50.0)
+
+
+def team_rating_from_record(
+    name: str,
+    league: str,
+    wins: float,
+    losses: float,
+    draws_or_ot: float,
+    source: str,
+    point_diff_per_game: float | None = None,
+) -> TeamRating | None:
+    games = wins + losses + draws_or_ot
+    if games <= 0:
+        return None
+
+    record_rate = bayesian_rate(wins, losses, draws_or_ot, prior_rate=0.50, prior_games=12.0)
+
+    # Point differential is often more predictive than raw W/L. Use it only as a small adjustment.
+    if point_diff_per_game is not None:
+        # Convert margin into a probability-like strength shift; keep it bounded to avoid overfitting.
+        pd_shift = max(-0.10, min(0.10, point_diff_per_game / 120.0))
+        rating_value = max(0.01, min(0.99, record_rate + pd_shift))
+        source = f"{source}; Bayesian record + point-diff adjustment"
+    else:
+        rating_value = record_rate
+        source = f"{source}; Bayesian record"
+
+    return TeamRating(
+        name=name,
+        league=league,
+        rating=rating_value,
+        source=source,
+        games=games,
+        wins=wins,
+        losses=losses,
+        draws_or_ot=draws_or_ot,
+        confidence=games_confidence(games, league_full_season_games(league)),
+    )
+
+
 def parse_espn_team_ratings(payload: dict, league: str, source: str) -> dict[tuple[str, str], TeamRating]:
     ratings: dict[tuple[str, str], TeamRating] = {}
     for entry in iter_espn_standing_entries(payload):
         team = entry.get("team", {})
-        stats = {stat.get("name"): stat.get("value") for stat in entry.get("stats", []) if isinstance(stat, dict)}
-        wins = optional_float(stats.get("wins")) or 0.0
-        losses = optional_float(stats.get("losses")) or 0.0
-        ot_losses = optional_float(stats.get("otLosses")) or 0.0
-        points = optional_float(stats.get("points"))
-        games = wins + losses + ot_losses
+        stats = {
+            stat.get("name"): stat.get("value")
+            for stat in entry.get("stats", [])
+            if isinstance(stat, dict)
+        }
+        wins = stat_float(stats, "wins", "overallWins") or 0.0
+        losses = stat_float(stats, "losses", "overallLosses") or 0.0
+        draws_or_ot = stat_float(stats, "otLosses", "ties", "draws") or 0.0
+        games = wins + losses + draws_or_ot
         if games <= 0:
             continue
-        rating_value = points / (2 * games) if league == "nhl" and points is not None else wins / games
-        rating = TeamRating(
-            name=first_present(team.get("displayName"), team.get("name")),
-            league=league,
-            rating=max(0.01, min(0.99, rating_value)),
-            source=source,
+
+        point_diff = stat_float(
+            stats,
+            "pointDifferential",
+            "pointsDifferential",
+            "differential",
+            "avgPointDifferential",
         )
+        point_diff_per_game = None
+        if point_diff is not None:
+            # ESPN sometimes exposes total differential and sometimes average differential.
+            point_diff_per_game = point_diff / games if abs(point_diff) > 40 else point_diff
+
+        team_name = first_present(team.get("displayName"), team.get("name"))
+        rating = team_rating_from_record(
+            name=team_name,
+            league=league,
+            wins=wins,
+            losses=losses,
+            draws_or_ot=draws_or_ot,
+            source=source,
+            point_diff_per_game=point_diff_per_game,
+        )
+        if rating is None:
+            continue
         add_team_rating(
             ratings,
             league,
@@ -708,9 +852,9 @@ def parse_espn_team_ratings(payload: dict, league: str, source: str) -> dict[tup
             team.get("shortDisplayName", ""),
             team.get("name", ""),
             team.get("abbreviation", ""),
+            team.get("location", ""),
         )
     return ratings
-
 
 def parse_mlb_team_ratings(payload: dict) -> dict[tuple[str, str], TeamRating]:
     ratings: dict[tuple[str, str], TeamRating] = {}
@@ -722,15 +866,26 @@ def parse_mlb_team_ratings(payload: dict) -> dict[tuple[str, str], TeamRating]:
             games = wins + losses
             if games <= 0:
                 continue
-            rating = TeamRating(
+            rating = team_rating_from_record(
                 name=team.get("name", ""),
                 league="mlb",
-                rating=max(0.01, min(0.99, wins / games)),
+                wins=wins,
+                losses=losses,
+                draws_or_ot=0.0,
                 source="MLB Stats API standings",
             )
-            add_team_rating(ratings, "mlb", rating, team.get("name", ""), team.get("abbreviation", ""))
+            if rating is None:
+                continue
+            add_team_rating(
+                ratings,
+                "mlb",
+                rating,
+                team.get("name", ""),
+                team.get("abbreviation", ""),
+                team.get("teamName", ""),
+                team.get("clubName", ""),
+            )
     return ratings
-
 
 def localized_description(value: Any, locale: str = "en-GB") -> str:
     if isinstance(value, str):
@@ -766,7 +921,14 @@ def parse_fifa_team_ratings(payload: dict) -> dict[tuple[str, str], TeamRating]:
         source = "FIFA men's ranking" + (f" {pub_date}" if pub_date else "")
         # Convert FIFA point differences into a relative strength. Normalization happens inside each event group.
         relative_strength = max(0.01, 10 ** ((points - FIFA_RATING_BASELINE) / FIFA_ELO_SCALE))
-        rating = TeamRating(name=name, league="fifawc", rating=relative_strength, source=source)
+        rating = TeamRating(
+            name=name,
+            league="fifawc",
+            rating=relative_strength,
+            source=f"{source}; FIFA rating points",
+            games=12.0,
+            confidence=0.55,
+        )
         add_team_rating(ratings, "fifawc", rating, name, country_code, *FIFA_COUNTRY_ALIASES.get(country_code, []))
     return ratings
 
@@ -1150,7 +1312,7 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
 
 
 # ================== AUTOMATED MODELS ==================
-def parse_record_rating(record: str) -> float | None:
+def parse_record_signal(record: str) -> RecordSignal | None:
     if not record:
         return None
     match = re.fullmatch(r"\s*(\d+)-(\d+)(?:-(\d+))?\s*", record)
@@ -1162,12 +1324,43 @@ def parse_record_rating(record: str) -> float | None:
     games = wins + losses + draws_or_ot
     if games <= 0:
         return None
-    return max(0.01, min(0.99, (wins + 0.5 * draws_or_ot) / games))
+    rating = bayesian_rate(wins, losses, draws_or_ot, prior_rate=0.50, prior_games=12.0)
+    # A record extracted from a market title is weaker than a trusted standings feed.
+    confidence = min(0.35, games_confidence(games, 82.0) * 0.50)
+    return RecordSignal(
+        rating=rating,
+        games=games,
+        wins=wins,
+        losses=losses,
+        draws_or_ot=draws_or_ot,
+        confidence=confidence,
+    )
+
+
+def parse_record_rating(record: str) -> float | None:
+    signal = parse_record_signal(record)
+    return signal.rating if signal else None
+
+
+def safe_logit(probability: float) -> float:
+    p = max(0.01, min(0.99, probability))
+    return math.log(p / (1 - p))
+
+
+def sigmoid(value: float) -> float:
+    if value >= 0:
+        z = math.exp(-value)
+        return 1 / (1 + z)
+    z = math.exp(value)
+    return z / (1 + z)
 
 
 def event_group_key(outcome: MarketOutcome) -> str:
     name = outcome.event_name or outcome.market_name
-    # For event-based multi-market questions, all YES markets under one event should be grouped.
+    # Group all candidate outcomes under the same event, but avoid grouping spreads/totals with moneyline-style bets.
+    market_text = f"{outcome.market_name} {outcome.outcome}".lower()
+    if re.search(r"\b(spread|total|over|under|handicap)\b|[+-]\d+(?:\.\d+)?", market_text):
+        name = outcome.market_name
     return normalize_name(name)
 
 
@@ -1187,6 +1380,28 @@ def is_actionable_estimate(estimate: ProbabilityEstimate | None) -> bool:
     return estimate is not None and estimate_quality(estimate) != "Baseline"
 
 
+def is_supported_model_outcome(outcome: MarketOutcome) -> bool:
+    side = outcome.outcome.strip().upper()
+    if side == "NO":
+        return False
+    if outcome.category == "politics":
+        return False
+    if outcome.category != "sports" and outcome.league not in {"nba", "nhl", "mlb", "fifawc"}:
+        return False
+    if not outcome.participant:
+        return False
+
+    text = f"{outcome.market_name} {outcome.outcome} {outcome.participant}".lower()
+    # Do not treat spread/total/over-under lines as simple win probabilities.
+    if re.search(r"\b(over|under|total|spread|handicap)\b", text):
+        return False
+    if re.search(r"(?:^|\s)[ou]\s*\d+(?:\.\d+)?\b", text):
+        return False
+    if re.search(r"[+-]\d+(?:\.\d+)?", outcome.outcome):
+        return False
+    return side == "YES" or bool(outcome.participant)
+
+
 def lookup_team_rating(data: SportsModelData, league: str, participant: str) -> TeamRating | None:
     if not league or not participant:
         return None
@@ -1194,22 +1409,40 @@ def lookup_team_rating(data: SportsModelData, league: str, participant: str) -> 
     exact = data.ratings.get((league.lower(), normalized))
     if exact:
         return exact
+
+    # Token-overlap match is safer than raw substring matching for names like NY, LA, O/U, etc.
+    participant_tokens = {token for token in normalized.split() if len(token) >= 3}
+    if not participant_tokens:
+        return None
+    best: tuple[int, TeamRating] | None = None
     for (rating_league, rating_name), rating in data.ratings.items():
         if rating_league != league.lower():
             continue
-        # Avoid very short fuzzy matches that create false positives.
-        if len(normalized) >= 4 and (normalized in rating_name or rating_name in normalized):
-            return rating
-    return None
+        rating_tokens = {token for token in rating_name.split() if len(token) >= 3}
+        overlap = len(participant_tokens & rating_tokens)
+        if overlap <= 0:
+            continue
+        if best is None or overlap > best[0]:
+            best = (overlap, rating)
+    return best[1] if best else None
 
 
-def outcome_strength(outcome: MarketOutcome, sports_data: SportsModelData) -> tuple[float, str] | None:
+def outcome_signal(outcome: MarketOutcome, sports_data: SportsModelData) -> ModelSignal | None:
     rating = lookup_team_rating(sports_data, outcome.league, outcome.participant)
     if rating is not None:
-        return rating.rating, f"auto:rating:{rating.source}"
-    record_rating = parse_record_rating(outcome.record)
-    if record_rating is not None:
-        return record_rating, "auto:record-in-market"
+        return ModelSignal(
+            strength=rating.rating,
+            source=f"auto:rating:{rating.source}; games={rating.games:.0f}; confidence={rating.confidence:.2f}",
+            confidence=rating.confidence,
+        )
+
+    record_signal = parse_record_signal(outcome.record)
+    if record_signal is not None:
+        return ModelSignal(
+            strength=record_signal.rating,
+            source=f"auto:record-in-market; games={record_signal.games:.0f}; confidence={record_signal.confidence:.2f}",
+            confidence=record_signal.confidence,
+        )
     return None
 
 
@@ -1218,8 +1451,15 @@ def event_exponent(group: list[MarketOutcome]) -> float:
         return 1.0
     event = group[0].event_name.lower() if group else ""
     if any(word in event for word in ["champion", "winner", "mvp", "award", "golden boot"]):
-        return 3.0
-    return 1.5
+        return 1.75
+    return 1.25
+
+
+def signal_log_score(signal: ModelSignal) -> float:
+    # Ratings in 0..1 are treated as win-rate-like. FIFA relative strengths can be >1, so log them.
+    if 0 < signal.strength < 1:
+        return safe_logit(signal.strength)
+    return math.log(max(0.001, signal.strength))
 
 
 def de_vigged_market_probs(group: list[MarketOutcome]) -> dict[str, float]:
@@ -1233,6 +1473,46 @@ def no_edge_market_baseline(outcome: MarketOutcome) -> ProbabilityEstimate:
     return ProbabilityEstimate(
         true_prob=max(0.001, min(0.999, outcome.market_prob)),
         source="auto:market-baseline (no edge)",
+        model_probability=None,
+        market_prior=outcome.market_prob,
+        confidence=0.0,
+        effective_model_weight=0.0,
+        max_shift_pp=0.0,
+    )
+
+
+def blend_model_with_market_prior(
+    outcome: MarketOutcome,
+    model_prob: float,
+    market_prior: float,
+    signal_source: str,
+    confidence: float,
+    config: AnalysisConfig,
+) -> ProbabilityEstimate | None:
+    confidence = max(0.0, min(1.0, confidence))
+    if confidence < config.min_model_confidence:
+        return None
+
+    effective_weight = max(0.0, min(config.model_blend, config.model_blend * confidence))
+    blended = market_prior + effective_weight * (model_prob - market_prior)
+
+    # Hard cap model movement from the market prior. This prevents weak standings signals from creating absurd edges.
+    max_shift = (config.max_model_shift_pp / 100.0) * max(0.25, confidence)
+    shift = max(-max_shift, min(max_shift, blended - market_prior))
+    true_prob = max(0.001, min(0.999, market_prior + shift))
+
+    return ProbabilityEstimate(
+        true_prob=true_prob,
+        source=(
+            f"{signal_source}; market_prior={market_prior:.1%}; "
+            f"raw_model={model_prob:.1%}; confidence={confidence:.2f}; "
+            f"effective_weight={effective_weight:.2f}; shift_cap={max_shift * 100:.1f}pp"
+        ),
+        model_probability=model_prob,
+        market_prior=market_prior,
+        confidence=confidence,
+        effective_model_weight=effective_weight,
+        max_shift_pp=max_shift * 100,
     )
 
 
@@ -1241,39 +1521,60 @@ def build_event_model_estimates(
     sports_data: SportsModelData,
     config: AnalysisConfig,
 ) -> dict[str, ProbabilityEstimate]:
+    if not group:
+        return {}
     if sum(outcome.market_prob for outcome in group) < config.min_event_market_coverage:
         return {}
 
-    strengths: dict[str, float] = {}
-    sources: dict[str, str] = {}
+    signals: dict[str, ModelSignal] = {}
     for outcome in group:
-        strength = outcome_strength(outcome, sports_data)
-        if strength is None:
+        if not is_supported_model_outcome(outcome):
             continue
-        strengths[outcome.key] = strength[0]
-        sources[outcome.key] = strength[1]
+        signal = outcome_signal(outcome, sports_data)
+        if signal is not None:
+            signals[outcome.key] = signal
 
-    if len(strengths) < 2:
+    # Need at least two modeled competitors in the same event. A single YES market without the opponent is not enough.
+    if len(signals) < 2:
         return {}
 
     exponent = event_exponent(group)
-    raw_scores = {key: max(0.001, strength) ** exponent for key, strength in strengths.items()}
+    raw_scores: dict[str, float] = {}
+    for key, signal in signals.items():
+        score = signal_log_score(signal) * exponent
+        # Avoid overflow while preserving ordering.
+        raw_scores[key] = math.exp(max(-8.0, min(8.0, score)))
+
     score_total = sum(raw_scores.values())
     if score_total <= 0:
         return {}
 
-    market_probs = de_vigged_market_probs(group)
+    market_probs = de_vigged_market_probs([outcome for outcome in group if outcome.key in signals])
+    coverage = sum(outcome.market_prob for outcome in group if outcome.key in signals)
+    coverage_confidence = max(0.0, min(1.0, coverage))
+    avg_signal_confidence = sum(signal.confidence for signal in signals.values()) / len(signals)
+    group_confidence = min(avg_signal_confidence, coverage_confidence)
+
+    source_kinds = {"record" if signals[key].source.startswith("auto:record-in-market") else "rating" for key in signals}
+    source_prefix = "auto:record-in-market" if source_kinds == {"record"} else "auto:rating:conservative sports model"
+
     estimates: dict[str, ProbabilityEstimate] = {}
     for outcome in group:
         if outcome.key not in raw_scores:
             continue
         model_prob = raw_scores[outcome.key] / score_total
-        market_prob = market_probs.get(outcome.key, outcome.market_prob)
-        true_prob = config.model_blend * model_prob + (1 - config.model_blend) * market_prob
-        estimates[outcome.key] = ProbabilityEstimate(
-            true_prob=max(0.001, min(0.999, true_prob)),
-            source=f"{sources[outcome.key]} ({config.model_blend:.0%} model blend)",
+        market_prior = market_probs.get(outcome.key, outcome.market_prob)
+        source = f"{source_prefix}; {signals[outcome.key].source}"
+        estimate = blend_model_with_market_prior(
+            outcome=outcome,
+            model_prob=model_prob,
+            market_prior=market_prior,
+            signal_source=source,
+            confidence=group_confidence,
+            config=config,
         )
+        if estimate is not None:
+            estimates[outcome.key] = estimate
     return estimates
 
 
@@ -1289,7 +1590,7 @@ def build_auto_model_provider(
     for outcome in outcomes:
         if config.skip_politics_auto_model and outcome.category == "politics":
             continue
-        if outcome.outcome.strip().upper() != "YES":
+        if not is_supported_model_outcome(outcome):
             continue
         groups[event_group_key(outcome)].append(outcome)
 
@@ -1338,6 +1639,11 @@ def build_estimate_display_df(outcomes: list[MarketOutcome], provider: Probabili
                 "Participant": outcome.participant,
                 "Buy Probability": outcome.market_prob * 100,
                 "Auto True Probability %": estimate.true_prob * 100 if estimate else None,
+                "Raw Model Probability %": estimate.model_probability * 100 if estimate and estimate.model_probability is not None else None,
+                "Market Prior %": estimate.market_prior * 100 if estimate and estimate.market_prior is not None else None,
+                "Model Confidence": estimate.confidence if estimate else None,
+                "Effective Model Weight": estimate.effective_model_weight if estimate else None,
+                "Shift Cap pp": estimate.max_shift_pp if estimate else None,
                 "Model Source": estimate.source if estimate else "no model",
                 "Estimate Quality": estimate_quality(estimate),
                 "Category": outcome.category,
@@ -1434,6 +1740,11 @@ def analyze_value(
                 "Live Spread %": outcome.live_spread_pct,
                 "Price Source": outcome.price_source,
                 "Source Quality": quality,
+                "Raw Model Probability": estimate.model_probability,
+                "Market Prior": estimate.market_prior,
+                "Model Confidence": estimate.confidence,
+                "Effective Model Weight": estimate.effective_model_weight,
+                "Shift Cap pp": estimate.max_shift_pp,
                 "Source": estimate.source,
                 "End Date": outcome.end_date,
                 "Market Key": outcome.key,
@@ -1493,6 +1804,11 @@ def build_edge_review_df(
                 "Live Spread %": outcome.live_spread_pct,
                 "Price Source": outcome.price_source,
                 "Source Quality": estimate_quality(estimate),
+                "Raw Model Probability": estimate.model_probability,
+                "Market Prior": estimate.market_prior,
+                "Model Confidence": estimate.confidence,
+                "Effective Model Weight": estimate.effective_model_weight,
+                "Shift Cap pp": estimate.max_shift_pp,
                 "Source": estimate.source,
                 "Status": "Passes filters" if not blockers else "Below: " + ", ".join(blockers),
             }
@@ -1533,6 +1849,14 @@ def display_value_table(df: pd.DataFrame) -> None:
     display_df["Live Bid"] = display_df["Live Bid"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.3f}")
     display_df["Live Ask"] = display_df["Live Ask"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.3f}")
     display_df["Live Spread %"] = display_df["Live Spread %"].map(lambda v: format_optional_pct(v, 1))
+    for col in ["Raw Model Probability", "Market Prior"]:
+        if col in display_df:
+            display_df[col] = display_df[col].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1%}")
+    for col in ["Model Confidence", "Effective Model Weight"]:
+        if col in display_df:
+            display_df[col] = display_df[col].map(lambda v: "N/A" if pd.isna(v) else f"{v:.2f}")
+    if "Shift Cap pp" in display_df:
+        display_df["Shift Cap pp"] = display_df["Shift Cap pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
 
     st.dataframe(
         display_df[
@@ -1557,6 +1881,11 @@ def display_value_table(df: pd.DataFrame) -> None:
                 "Live Spread %",
                 "Price Source",
                 "Source Quality",
+                "Raw Model Probability",
+                "Market Prior",
+                "Model Confidence",
+                "Effective Model Weight",
+                "Shift Cap pp",
                 "Source",
                 "End Date",
             ]
@@ -1576,6 +1905,14 @@ def display_edge_review_table(df: pd.DataFrame) -> None:
     display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
     display_df["Kelly %"] = display_df["Kelly %"].map("{:.2f}%".format)
     display_df["Live Spread %"] = display_df["Live Spread %"].map(lambda v: format_optional_pct(v, 1))
+    for col in ["Raw Model Probability", "Market Prior"]:
+        if col in display_df:
+            display_df[col] = display_df[col].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1%}")
+    for col in ["Model Confidence", "Effective Model Weight"]:
+        if col in display_df:
+            display_df[col] = display_df[col].map(lambda v: "N/A" if pd.isna(v) else f"{v:.2f}")
+    if "Shift Cap pp" in display_df:
+        display_df["Shift Cap pp"] = display_df["Shift Cap pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
     st.dataframe(display_df, width="stretch", height=420, hide_index=True)
 
 
@@ -1653,6 +1990,21 @@ with st.expander("Model coverage and scan stats", expanded=False):
         coverage_df["Auto True Probability %"] = coverage_df["Auto True Probability %"].map(
             lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
         )
+        coverage_df["Raw Model Probability %"] = coverage_df["Raw Model Probability %"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
+        )
+        coverage_df["Market Prior %"] = coverage_df["Market Prior %"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
+        )
+        coverage_df["Model Confidence"] = coverage_df["Model Confidence"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.2f}"
+        )
+        coverage_df["Effective Model Weight"] = coverage_df["Effective Model Weight"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.2f}"
+        )
+        coverage_df["Shift Cap pp"] = coverage_df["Shift Cap pp"].map(
+            lambda value: "N/A" if pd.isna(value) else f"{value:.1f}pp"
+        )
         coverage_df["Live Spread %"] = coverage_df["Live Spread %"].map(lambda v: format_optional_pct(v, 1))
         st.dataframe(
             coverage_df[
@@ -1662,6 +2014,11 @@ with st.expander("Model coverage and scan stats", expanded=False):
                     "Participant",
                     "Buy Probability",
                     "Auto True Probability %",
+                    "Raw Model Probability %",
+                    "Market Prior %",
+                    "Model Confidence",
+                    "Effective Model Weight",
+                    "Shift Cap pp",
                     "Estimate Quality",
                     "Model Source",
                     "Category",
