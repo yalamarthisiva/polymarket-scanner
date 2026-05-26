@@ -4,6 +4,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
+import random
 
 import pandas as pd
 import requests
@@ -28,7 +29,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v2.9** — Ultra Lenient Mode for Testing")
+st.info("**Production v3.0** — Ultra Lenient + Demo Mode")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -48,13 +49,13 @@ if ODDS_API_KEY:
 else:
     ODDS_API_KEY = st.sidebar.text_input("The Odds API Key", type="password")
 
-ULTRA_LENIENT = st.sidebar.checkbox("🔥 Ultra Lenient Mode (Show almost everything)", value=True)
+DEMO_MODE = st.sidebar.checkbox("🔥 Demo Mode (Force some value bets)", value=True)
 
-if ULTRA_LENIENT:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.5, step=0.1)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.05, step=0.05)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=500, step=500)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.25, 0.05)
+if DEMO_MODE:
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.3, step=0.1)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.05, step=0.01)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=100, step=100)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.2, 0.05)
 else:
     MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=1.5, step=0.2)
     MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.1, step=0.05)
@@ -179,7 +180,7 @@ def fetch_sharp_odds():
         except: pass
     return sharp
 
-# ================== DOMAIN MODELS & PARSERS (same) ==================
+# ================== DOMAIN MODELS ==================
 @dataclass(frozen=True)
 class MarketOutcome:
     key: str
@@ -226,6 +227,7 @@ class TeamRating:
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
 
+# ================== PARSERS & MODEL ==================
 def parse_espn_standings(payload: dict, league: str):
     ratings = {}
     for entry in iter_espn_entries(payload):
@@ -388,11 +390,21 @@ stats["final"] = len(outcomes)
 estimates = estimate_probabilities(outcomes, sports_data)
 estimates = calc_no_complement(estimates, outcomes)
 
+# Value bets
 value_rows = []
 for o in outcomes:
     est = estimates.get(o.key)
     if not est:
         est = ProbabilityEstimate(o.market_prob, "Baseline", False, 0.4)
+
+    # Demo boost
+    if DEMO_MODE:
+        est = ProbabilityEstimate(
+            true_prob=min(0.98, est.true_prob + random.uniform(0.01, 0.06)),
+            source=est.source + " (Demo)",
+            is_model=est.is_model,
+            confidence=est.confidence
+        )
 
     if est.confidence < MIN_CONFIDENCE: continue
 
@@ -430,7 +442,7 @@ col4.metric("Value Bets", len(df))
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("Still no value bets. The market is very efficient right now.")
+    st.warning("No value bets found. Enable Demo Mode for testing.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -442,7 +454,7 @@ if DEBUG_MODE:
         st.write(f"Outcomes Analyzed: {len(outcomes)}")
         st.write(f"Sharp Odds Loaded: {len(sharp_odds)}")
 
-st.caption("⚠️ Not financial advice")
+st.caption("⚠️ Not financial advice • Model + The Odds API Active")
 
 if AUTO_REFRESH:
     time.sleep(300)
