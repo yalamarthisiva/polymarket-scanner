@@ -4,7 +4,6 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
-import random
 
 import pandas as pd
 import requests
@@ -27,9 +26,9 @@ FIFA_COUNTRY_ALIASES = {
     "USA": ["USA", "United States", "US"],
 }
 
-st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
-st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v3.0** — Ultra Lenient + Demo Mode")
+st.set_page_config(page_title="Polymarket Sports Scanner", layout="wide")
+st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
+st.info("**Production v3.1** — Clean Model with Sharp Edge Comparison")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -45,35 +44,26 @@ BANKROLL = st.sidebar.number_input("Bankroll ($)", value=10000, min_value=100, s
 
 ODDS_API_KEY = get_odds_api_key()
 if ODDS_API_KEY:
-    st.sidebar.success("✅ Odds API Key loaded from secrets")
+    st.sidebar.success("✅ Sharp Odds Active")
 else:
-    ODDS_API_KEY = st.sidebar.text_input("The Odds API Key", type="password")
+    st.sidebar.warning("Add Odds API Key in secrets for sharp comparison")
 
-DEMO_MODE = st.sidebar.checkbox("🔥 Demo Mode (Force some value bets)", value=True)
-
-if DEMO_MODE:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.3, step=0.1)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.05, step=0.01)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=100, step=100)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.2, 0.05)
-else:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=1.5, step=0.2)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.1, step=0.05)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=1000, step=1000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.3, 0.05)
+MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=3.0, step=0.5)
+MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.3, step=0.1)
+MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=10000, step=5000)
+MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.45, 0.05)
 
 KELLY_FRACTION = st.sidebar.slider("Kelly Fraction", 0.05, 1.0, 0.25, 0.05)
 
 USE_AUTO_MODEL = st.sidebar.checkbox("Use Sport Model", value=True)
-REQUIRE_MODEL_ONLY = st.sidebar.checkbox("Require Strong Model Only", value=False)
+REQUIRE_MODEL_ONLY = st.sidebar.checkbox("Require Model Estimate", value=False)
 
 st.sidebar.markdown("---")
 CAT_ALL = st.sidebar.checkbox("All Categories", value=True)
 CAT_SPORTS = st.sidebar.checkbox("Sports", value=True)
 SIDE_FILTER = st.sidebar.radio("Bet Side", ["Both", "YES only", "NO only"], index=0)
 
-AUTO_REFRESH = st.sidebar.checkbox("Auto Refresh (5 min)", value=False)
-DEBUG_MODE = st.sidebar.checkbox("Show Debug Info", value=True)
+DEBUG_MODE = st.sidebar.checkbox("Debug Info", value=False)
 
 # ================== HELPERS ==================
 def normalize_name(value: str) -> str:
@@ -227,7 +217,7 @@ class TeamRating:
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
 
-# ================== PARSERS & MODEL ==================
+# ================== PARSERS ==================
 def parse_espn_standings(payload: dict, league: str):
     ratings = {}
     for entry in iter_espn_entries(payload):
@@ -300,6 +290,7 @@ def lookup_team_rating(data: SportsModelData, league: str, participant: str):
             return rating
     return None
 
+# ================== MODEL ==================
 def estimate_probabilities(outcomes, sports_data):
     estimates = {}
     groups = defaultdict(list)
@@ -394,17 +385,10 @@ estimates = calc_no_complement(estimates, outcomes)
 value_rows = []
 for o in outcomes:
     est = estimates.get(o.key)
+    if REQUIRE_MODEL_ONLY and not (est and est.is_model):
+        continue
     if not est:
         est = ProbabilityEstimate(o.market_prob, "Baseline", False, 0.4)
-
-    # Demo boost
-    if DEMO_MODE:
-        est = ProbabilityEstimate(
-            true_prob=min(0.98, est.true_prob + random.uniform(0.01, 0.06)),
-            source=est.source + " (Demo)",
-            is_model=est.is_model,
-            confidence=est.confidence
-        )
 
     if est.confidence < MIN_CONFIDENCE: continue
 
@@ -418,7 +402,7 @@ for o in outcomes:
     bet_size = BANKROLL * kelly_full * KELLY_FRACTION
 
     value_rows.append({
-        "Market": o.market_name[:60],
+        "Market": o.market_name[:65],
         "Side": o.outcome,
         "PM Prob%": round(o.market_prob * 100, 1),
         "Model Prob%": round(est.true_prob * 100, 1),
@@ -442,7 +426,7 @@ col4.metric("Value Bets", len(df))
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("No value bets found. Enable Demo Mode for testing.")
+    st.warning("No value bets found with current filters.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -451,11 +435,10 @@ else:
 if DEBUG_MODE:
     with st.expander("Debug Info"):
         st.write(stats)
-        st.write(f"Outcomes Analyzed: {len(outcomes)}")
-        st.write(f"Sharp Odds Loaded: {len(sharp_odds)}")
+        st.write(f"Sharp Odds Events: {len(sharp_odds)}")
 
-st.caption("⚠️ Not financial advice • Model + The Odds API Active")
+st.caption("⚠️ Not financial advice • Model + Sharp Odds Comparison")
 
-if AUTO_REFRESH:
-    time.sleep(300)
+if st.button("Refresh Data"):
+    st.cache_data.clear()
     st.rerun()
