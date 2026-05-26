@@ -28,7 +28,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v2.5** — Relaxed Mode + Debug Stats + Secrets")
+st.info("**Production v2.6** — Fixed Odds API + Relaxed Mode")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -144,32 +144,39 @@ def fetch_sports_model():
 
 @st.cache_data(ttl=300)
 def fetch_sharp_odds():
-    if not ODDS_API_KEY: return {}
-    try:
-        r = requests.get(
-            f"{THE_ODDS_API_BASE}/sports/americanfootball_nfl,basketball_nba,baseball_mlb,soccer/odds",
-            params={"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "decimal"},
-            timeout=20
-        )
-        r.raise_for_status()
-        sharp = {}
-        for event in r.json():
-            home = normalize_name(event.get("home_team", ""))
-            away = normalize_name(event.get("away_team", ""))
-            for book in event.get("bookmakers", []):
-                for mkt in book.get("markets", []):
-                    if mkt.get("key") == "h2h":
-                        for outcome in mkt.get("outcomes", []):
-                            name = normalize_name(outcome.get("name", ""))
-                            price = optional_float(outcome.get("price"))
-                            if price and price > 0:
-                                sharp[(home, away, name)] = price
-        return sharp
-    except Exception as e:
-        st.warning(f"Odds API Error: {e}")
+    if not ODDS_API_KEY:
         return {}
+    sports_list = ["americanfootball_nfl", "basketball_nba", "baseball_mlb", "soccer"]
+    sharp = {}
+    for sport in sports_list:
+        try:
+            r = requests.get(
+                f"{THE_ODDS_API_BASE}/sports/{sport}/odds",
+                params={
+                    "apiKey": ODDS_API_KEY,
+                    "regions": "us",
+                    "markets": "h2h",
+                    "oddsFormat": "decimal"
+                },
+                timeout=15
+            )
+            r.raise_for_status()
+            for event in r.json():
+                home = normalize_name(event.get("home_team", ""))
+                away = normalize_name(event.get("away_team", ""))
+                for book in event.get("bookmakers", []):
+                    for mkt in book.get("markets", []):
+                        if mkt.get("key") == "h2h":
+                            for outcome in mkt.get("outcomes", []):
+                                name = normalize_name(outcome.get("name", ""))
+                                price = optional_float(outcome.get("price"))
+                                if price and price > 0:
+                                    sharp[(home, away, name)] = price
+        except Exception as e:
+            st.warning(f"Odds API {sport} error: {e}")
+    return sharp
 
-# ================== DOMAIN MODELS ==================
+# ================== DOMAIN MODELS & PARSERS (same as before) ==================
 @dataclass(frozen=True)
 class MarketOutcome:
     key: str
@@ -216,7 +223,7 @@ class TeamRating:
 class SportsModelData:
     ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
 
-# ================== PARSERS & MODEL ==================
+# Parser functions (copy from previous version)
 def parse_espn_standings(payload: dict, league: str):
     ratings = {}
     for entry in iter_espn_entries(payload):
@@ -328,12 +335,11 @@ def calc_no_complement(estimates, outcomes):
                 result[o.key] = ProbabilityEstimate(1 - yes.true_prob, f"Complement ({yes.source})", yes.is_model, yes.confidence * 0.95)
     return result
 
-# ================== MAIN ==================
+# ================== MAIN LOGIC ==================
 markets = fetch_polymarket()
 sports_data = fetch_sports_model() if USE_AUTO_MODEL else SportsModelData()
 sharp_odds = fetch_sharp_odds()
 
-# Build outcomes with stats
 outcomes = []
 stats = {"total": len(markets), "open": 0, "category_pass": 0, "volume_pass": 0, "final": 0}
 
@@ -380,7 +386,6 @@ stats["final"] = len(outcomes)
 estimates = estimate_probabilities(outcomes, sports_data)
 estimates = calc_no_complement(estimates, outcomes)
 
-# Value bets
 value_rows = []
 for o in outcomes:
     est = estimates.get(o.key)
@@ -425,7 +430,7 @@ col4.metric("Value Bets", len(df))
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("No value bets found. Try enabling **Relaxed Mode** and disabling 'Require Strong Model'.")
+    st.warning("No value bets found. Try Relaxed Mode + disable 'Require Strong Model'.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
@@ -434,9 +439,9 @@ else:
 if DEBUG_MODE:
     with st.expander("Debug Statistics"):
         st.write(stats)
-        st.write(f"Sharp Odds Loaded: {len(sharp_odds)} events")
+        st.write(f"Sharp Odds Events Loaded: {len(sharp_odds)}")
 
-st.caption("⚠️ Not financial advice • Model + The Odds API Active")
+st.caption("⚠️ Not financial advice • The Odds API Active")
 
 if AUTO_REFRESH:
     time.sleep(300)
