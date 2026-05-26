@@ -3,7 +3,7 @@ Smart Polymarket US Value Tool - US public API only
 
 Run:
     pip install streamlit pandas requests
-    streamlit run smart_polymarket_value_tool_v4_2_us_action_messages.py
+    streamlit run smart_polymarket_value_tool_v4_5_directional_aggressive.py
 
 What this version fixes:
 - Uses only the Polymarket US public API at https://gateway.polymarket.us/v1.
@@ -309,7 +309,7 @@ USE_LIVE_CLOB_PRICES = st.sidebar.checkbox(
 LIVE_CLOB_MAX_TOKENS = st.sidebar.slider(
     "Max live US BBO markets per refresh", min_value=5, max_value=100, value=25, step=5
 )
-FETCH_PAGES = st.sidebar.slider("US gateway pages to fetch", min_value=1, max_value=10, value=2, step=1)
+FETCH_PAGES = st.sidebar.slider("US gateway pages to fetch", min_value=1, max_value=20, value=6, step=1)
 PAGE_SIZE = st.sidebar.slider("US gateway page size", min_value=25, max_value=100, value=100, step=25)
 
 st.sidebar.markdown("---")
@@ -420,20 +420,20 @@ RECOMMENDATION_MODE = st.sidebar.selectbox(
     index=1,
     help=(
         "Conservative picks only one row per event. Aggressive can recommend multiple value signals, "
-        "including correlated same-event picks, with per-event exposure caps."
+        "across independent events first; same-event opposite sides are blocked by default."
     ),
 )
 MAX_RECOMMENDED_BETS = st.sidebar.slider(
     "Max recommended bets shown",
     min_value=1,
     max_value=20,
-    value=5,
+    value=10,
     step=1,
 )
 ALLOW_CORRELATED_SAME_EVENT_BETS = st.sidebar.checkbox(
     "Allow correlated same-event bets",
     value=True,
-    help="Aggressive mode only. Allows multiple picks from the same event, but caps total exposure.",
+    help="Aggressive mode only. Allows same-event stacking only when it is not the opposite side of an already selected pick. Opposite sides remain blocked.",
 )
 MAX_RECOMMENDED_BETS_PER_EVENT = st.sidebar.slider(
     "Max recommended bets per event",
@@ -2176,6 +2176,12 @@ def build_action_message(row: pd.Series, action: str, sides: list[str] | None = 
             f"SKIP: {side} also shows model value, but another side in this event ranks stronger. "
             f"Conflict set: {side_text}. Do not stack both sides in conservative mode."
         )
+    if action.startswith("SKIP - opposite-side conflict"):
+        side_text = ", ".join(sides or [])
+        return (
+            f"SKIP: {side} is on the opposite side of an already selected pick in this same event. "
+            f"Conflict set: {side_text}. Do not buy both sides from the same matchup."
+        )
     if action.startswith("SKIP - same-event limit"):
         return (
             f"SKIP: {side} is a value signal, but the event already reached your aggressive per-event pick limit. "
@@ -2305,6 +2311,7 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
     recommended_count = 0
     per_event_count: dict[str, int] = defaultdict(int)
     per_event_exposure: dict[str, float] = defaultdict(float)
+    per_event_primary_side: dict[str, str] = {}
     max_per_event = config.max_recommended_bets_per_event if config.allow_correlated_same_event_bets else 1
     event_cap = max(0.0, config.bankroll * config.max_event_exposure_pct / 100.0)
 
@@ -2324,6 +2331,8 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
             action = "NO TRADE - spread too wide"
         elif best_by_group_side.get(duplicate_key) != idx:
             action = "DUPLICATE - prefer stronger same-side row"
+        elif group in per_event_primary_side and side != per_event_primary_side[group]:
+            action = "SKIP - opposite-side conflict"
         elif recommended_count >= config.max_recommended_bets:
             action = "SKIP - portfolio limit"
         elif per_event_count[group] >= max_per_event:
@@ -2348,6 +2357,8 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
                     recommended_count += 1
                     per_event_count[group] += 1
                     per_event_exposure[group] += stake
+                    if group not in per_event_primary_side:
+                        per_event_primary_side[group] = side
 
         result.at[idx, "Action"] = action
         result.at[idx, "Action Message"] = build_action_message(result.loc[idx], action, sides)
@@ -2359,12 +2370,13 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
         "AGGRESSIVE SAME-EVENT BET - verify live price": 3,
         "RECOMMENDED BET": 4,
         "RECOMMENDED BET - verify live price": 5,
-        "SKIP - same-event limit": 6,
-        "SKIP - event exposure cap": 7,
-        "SKIP - portfolio limit": 8,
-        "DUPLICATE - prefer stronger same-side row": 9,
-        "RESEARCH ONLY - futures": 10,
-        "NO TRADE - spread too wide": 11,
+        "SKIP - opposite-side conflict": 6,
+        "SKIP - same-event limit": 7,
+        "SKIP - event exposure cap": 8,
+        "SKIP - portfolio limit": 9,
+        "DUPLICATE - prefer stronger same-side row": 10,
+        "RESEARCH ONLY - futures": 11,
+        "NO TRADE - spread too wide": 12,
         "REVIEW ONLY": 19,
     }
     result["Action Rank"] = result["Action"].map(priority).fillna(19).astype(int)
@@ -2733,7 +2745,8 @@ if edge_review_df.empty:
 else:
     display_edge_review_table(edge_review_df)
 
-st.subheader("3. Value Bets — Aggressive Portfolio + All Signals")
+st.subheader("3. Value Bets — Directional Aggressive Portfolio + All Signals")
+st.caption("Aggressive mode now tries to build a multi-bet portfolio across independent events. It will not recommend opposite teams from the same matchup as simultaneous bets.")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
 if not value_df.empty:
     value_df = add_value_action_messages(value_df, CONFIG)
@@ -2760,7 +2773,7 @@ else:
     st.download_button("Download value bets CSV", csv, "polymarket_value_bets.csv", "text/csv")
 
 st.caption(
-    "Not financial advice. Aggressive mode increases correlated exposure and can lose faster. A positive edge in this app only means the selected heuristic model is above the market price. "
+    "Not financial advice. Aggressive mode increases exposure and can lose faster. This version blocks opposite-side same-event recommendations by default. A positive edge in this app only means the selected heuristic model is above the market price. "
     "Before risking money, validate the probability model, market rules, liquidity, spread, fees, and legal/compliance constraints."
 )
 
