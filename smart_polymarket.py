@@ -1,17 +1,17 @@
 """
-Smart Polymarket Value Tool - fixed / current API version
+Smart Polymarket US Value Tool - US public API only
 
 Run:
     pip install streamlit pandas requests
-    streamlit run smart_polymarket_value_tool_fixed.py
+    streamlit run smart_polymarket_value_tool_v4_us_only.py
 
 What this version fixes:
-- Uses Polymarket Gamma API for discovery instead of the stale/fragile gateway URL.
-- Handles Gamma /events and /markets response shapes, including paginated list payloads.
-- Parses outcomes, outcomePrices, clobTokenIds, event metadata, tags, volume, and liquidity defensively.
-- Optionally refreshes buy prices from the public CLOB orderbook using token_id.
+- Uses only the Polymarket US public API at https://gateway.polymarket.us/v1.
+- Fetches US events first, then flattens embedded markets; falls back to US /markets.
+- Parses marketSides, outcomes, outcomePrices, event metadata, tags, volume, and liquidity defensively.
+- Optionally refreshes live executable buy prices from the lightweight US /markets/{slug}/bbo endpoint.
 - Avoids treating unsupported/no-model markets as value bets unless you explicitly allow them.
-- Improves participant/league inference so sports rating models have a better chance to match.
+- Keeps the conservative probability / futures-safety model from v3.
 
 Important: this app is an analysis tool, not financial advice and not an automated trading bot.
 """
@@ -32,12 +32,11 @@ import requests
 import streamlit as st
 
 
-GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
-CLOB_BASE_URL = "https://clob.polymarket.com"
+POLYMARKET_US_PUBLIC_BASE_URL = "https://gateway.polymarket.us/v1"
 FIFA_MENS_RANKINGS_URL = "https://api.fifa.com/api/v3/rankings"
 
 REQUEST_HEADERS = {
-    "User-Agent": "smart-polymarket-value-tool/1.2-fast-safe",
+    "User-Agent": "smart-polymarket-us-value-tool/1.4-us-only",
     "Accept": "application/json",
 }
 
@@ -146,6 +145,13 @@ class AnalysisConfig:
     require_actionable_model: bool
     allow_record_only_value: bool
     skip_politics_auto_model: bool
+    use_conservative_betting_probability: bool
+    uncertainty_haircut_pp: float
+    min_value_confidence: float
+    allow_futures_value_bets: bool
+    futures_min_confidence: float
+    futures_max_shift_pp: float
+    require_live_prices_for_value: bool
     use_live_clob_prices: bool
     live_clob_max_tokens: int
     fetch_pages: int
@@ -164,7 +170,7 @@ class ParsedOutcome:
     live_ask: float | None = None
     live_mid: float | None = None
     live_spread_pct: float | None = None
-    price_source: str = "gamma"
+    price_source: str = "us_list"
 
 
 @dataclass(frozen=True)
@@ -214,8 +220,9 @@ class AutoModelProbabilityProvider:
 st.set_page_config(page_title="Smart Polymarket Value Tool", layout="wide")
 st.title("Smart Polymarket Value Tool")
 st.info(
-    "Uses Polymarket Gamma API for market discovery and optional public CLOB orderbook "
-    "prices. Probability estimates are conservative heuristics, not guaranteed edge."
+    "US-only mode: uses Polymarket US public API at gateway.polymarket.us for discovery "
+    "and optional /markets/{slug}/bbo live prices. Probability estimates are conservative heuristics. "
+    "Futures are research-only by default, and displayed edge is uncertainty-haircut adjusted."
 )
 
 st.sidebar.header("Bankroll & Filters")
@@ -268,7 +275,7 @@ MAX_LIVE_SPREAD_PCT = st.sidebar.slider(
     max_value=100.0,
     value=25.0,
     step=1.0,
-    help="Only applied when live CLOB bid/ask is available.",
+    help="Only applied when live Polymarket US BBO bid/ask is available.",
 )
 
 SORT_BY = st.sidebar.selectbox(
@@ -288,15 +295,15 @@ SORT_ASCENDING = st.sidebar.checkbox("Sort ascending", value=False)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Live Market Data")
 USE_LIVE_CLOB_PRICES = st.sidebar.checkbox(
-    "Use live CLOB orderbook buy prices",
+    "Use live Polymarket US BBO buy prices",
     value=False,
-    help="OFF by default so Streamlit Cloud does not hang on many public CLOB calls. Turn on only after the Gamma-only table loads.",
+    help="OFF by default so Streamlit Cloud loads fast. Turn on after the US gateway table loads.",
 )
 LIVE_CLOB_MAX_TOKENS = st.sidebar.slider(
-    "Max live CLOB tokens per refresh", min_value=5, max_value=100, value=25, step=5
+    "Max live US BBO markets per refresh", min_value=5, max_value=100, value=25, step=5
 )
-FETCH_PAGES = st.sidebar.slider("Gamma pages to fetch", min_value=1, max_value=10, value=2, step=1)
-PAGE_SIZE = st.sidebar.slider("Gamma page size", min_value=25, max_value=100, value=100, step=25)
+FETCH_PAGES = st.sidebar.slider("US gateway pages to fetch", min_value=1, max_value=10, value=2, step=1)
+PAGE_SIZE = st.sidebar.slider("US gateway page size", min_value=25, max_value=100, value=100, step=25)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Automation")
@@ -305,7 +312,7 @@ MODEL_BLEND = st.sidebar.slider(
     "Model weight",
     min_value=0.05,
     max_value=1.0,
-    value=0.25,
+    value=0.20,
     step=0.05,
     help="Maximum model weight before confidence shrinkage. Actual weight is lower when data quality is weak.",
 )
@@ -313,7 +320,7 @@ MIN_MODEL_CONFIDENCE = st.sidebar.slider(
     "Minimum model confidence",
     min_value=0.00,
     max_value=1.00,
-    value=0.18,
+    value=0.25,
     step=0.01,
     help="Filters weak estimates. Low-confidence records/partial matchups will remain baseline instead of creating fake edge.",
 )
@@ -321,7 +328,7 @@ MAX_MODEL_SHIFT_PP = st.sidebar.slider(
     "Max model move from market (pp)",
     min_value=1.0,
     max_value=25.0,
-    value=8.0,
+    value=5.0,
     step=0.5,
     help="Safety cap: after blending, the estimated true probability cannot move more than this many points from the de-vigged market prior.",
 )
@@ -345,6 +352,54 @@ ALLOW_RECORD_ONLY_VALUE = st.sidebar.checkbox(
 )
 SKIP_POLITICS_AUTO_MODEL = st.sidebar.checkbox(
     "Skip politics automation until polling/news model exists", value=True
+)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Value-Bet Safety")
+USE_CONSERVATIVE_BETTING_PROBABILITY = st.sidebar.checkbox(
+    "Use conservative betting probability",
+    value=True,
+    help="Edges/Kelly use a lower confidence-adjusted probability, not the optimistic model estimate.",
+)
+UNCERTAINTY_HAIRCUT_PP = st.sidebar.slider(
+    "Uncertainty haircut max (pp)",
+    min_value=0.0,
+    max_value=15.0,
+    value=5.0,
+    step=0.5,
+    help="When confidence is low, subtract up to this many probability points before calculating edge/Kelly.",
+)
+MIN_VALUE_CONFIDENCE = st.sidebar.slider(
+    "Minimum confidence for value bets",
+    min_value=0.00,
+    max_value=1.00,
+    value=0.35,
+    step=0.01,
+    help="Estimates below this confidence can appear in research tables but will not become value bets.",
+)
+ALLOW_FUTURES_VALUE_BETS = st.sidebar.checkbox(
+    "Allow futures as value bets",
+    value=False,
+    help="OFF by default. Long-horizon futures like World Cup, Stanley Cup, World Series need deeper models than standings/rankings.",
+)
+FUTURES_MIN_CONFIDENCE = st.sidebar.slider(
+    "Minimum confidence for futures",
+    min_value=0.00,
+    max_value=1.00,
+    value=0.60,
+    step=0.01,
+)
+FUTURES_MAX_SHIFT_PP = st.sidebar.slider(
+    "Max futures model move from market (pp)",
+    min_value=0.5,
+    max_value=15.0,
+    value=2.5,
+    step=0.5,
+)
+REQUIRE_LIVE_PRICES_FOR_VALUE = st.sidebar.checkbox(
+    "Require live US BBO price for value bets",
+    value=False,
+    help="Turn this on when you want execution-grade candidates only. If live US BBO pricing is off, value rows will be filtered out.",
 )
 
 st.sidebar.markdown("---")
@@ -401,6 +456,13 @@ CONFIG = AnalysisConfig(
     require_actionable_model=REQUIRE_ACTIONABLE_MODEL,
     allow_record_only_value=ALLOW_RECORD_ONLY_VALUE,
     skip_politics_auto_model=SKIP_POLITICS_AUTO_MODEL,
+    use_conservative_betting_probability=USE_CONSERVATIVE_BETTING_PROBABILITY,
+    uncertainty_haircut_pp=UNCERTAINTY_HAIRCUT_PP,
+    min_value_confidence=MIN_VALUE_CONFIDENCE,
+    allow_futures_value_bets=ALLOW_FUTURES_VALUE_BETS,
+    futures_min_confidence=FUTURES_MIN_CONFIDENCE,
+    futures_max_shift_pp=FUTURES_MAX_SHIFT_PP,
+    require_live_prices_for_value=REQUIRE_LIVE_PRICES_FOR_VALUE,
     use_live_clob_prices=USE_LIVE_CLOB_PRICES,
     live_clob_max_tokens=LIVE_CLOB_MAX_TOKENS,
     fetch_pages=FETCH_PAGES,
@@ -503,23 +565,33 @@ def tag_text(obj: dict) -> str:
     return " ".join(piece for piece in pieces if piece)
 
 
-# ================== POLYMARKET DATA LAYER ==================
-@st.cache_data(ttl=45, show_spinner="Fetching Polymarket events from Gamma API...")
-def fetch_gamma_events(page_size: int, pages: int) -> tuple[list[dict], dict[str, int | str]]:
+# ================== POLYMARKET US DATA LAYER ==================
+@st.cache_data(ttl=45, show_spinner="Fetching Polymarket US events...")
+def fetch_us_events(page_size: int, pages: int) -> tuple[list[dict], dict[str, int | str]]:
     events: list[dict] = []
-    stats: dict[str, int | str] = {"endpoint": "/events", "pages_requested": pages, "events_raw": 0}
+    stats: dict[str, int | str] = {
+        "endpoint": "US /v1/events",
+        "base_url": POLYMARKET_US_PUBLIC_BASE_URL,
+        "pages_requested": pages,
+        "events_raw": 0,
+    }
 
     for page in range(pages):
         params = {
             "active": "true",
             "closed": "false",
+            "archived": "false",
+            "includeHidden": "false",
             "limit": page_size,
             "offset": page * page_size,
-            "order": "volume24hr",
-            "ascending": "false",
+            "orderBy": "volume24hr",
+            "orderDirection": "desc",
         }
         response = requests.get(
-            f"{GAMMA_BASE_URL}/events", params=params, headers=REQUEST_HEADERS, timeout=25
+            f"{POLYMARKET_US_PUBLIC_BASE_URL}/events",
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=25,
         )
         response.raise_for_status()
         batch = response_to_list(response.json(), preferred_keys=("events", "data", "results"))
@@ -533,22 +605,32 @@ def fetch_gamma_events(page_size: int, pages: int) -> tuple[list[dict], dict[str
     return events, stats
 
 
-@st.cache_data(ttl=45, show_spinner="Fetching Polymarket markets from Gamma API...")
-def fetch_gamma_markets(page_size: int, pages: int) -> tuple[list[dict], dict[str, int | str]]:
+@st.cache_data(ttl=45, show_spinner="Fetching Polymarket US markets...")
+def fetch_us_markets(page_size: int, pages: int) -> tuple[list[dict], dict[str, int | str]]:
     markets: list[dict] = []
-    stats: dict[str, int | str] = {"endpoint": "/markets", "pages_requested": pages, "markets_raw": 0}
+    stats: dict[str, int | str] = {
+        "endpoint": "US /v1/markets",
+        "base_url": POLYMARKET_US_PUBLIC_BASE_URL,
+        "pages_requested": pages,
+        "markets_raw": 0,
+    }
 
     for page in range(pages):
         params = {
             "active": "true",
             "closed": "false",
+            "archived": "false",
+            "includeHidden": "false",
             "limit": page_size,
             "offset": page * page_size,
-            "order": "volumeNum",
-            "ascending": "false",
+            "orderBy": "volumeNum",
+            "orderDirection": "desc",
         }
         response = requests.get(
-            f"{GAMMA_BASE_URL}/markets", params=params, headers=REQUEST_HEADERS, timeout=25
+            f"{POLYMARKET_US_PUBLIC_BASE_URL}/markets",
+            params=params,
+            headers=REQUEST_HEADERS,
+            timeout=25,
         )
         response.raise_for_status()
         batch = response_to_list(response.json(), preferred_keys=("markets", "data", "results"))
@@ -566,10 +648,10 @@ def flatten_event_markets(events: list[dict]) -> list[dict]:
     flattened: list[dict] = []
     for event in events:
         event_title = first_present(event.get("title"), event.get("question"), event.get("slug"))
-        event_category = first_present(event.get("category"), event.get("type"), event.get("collectionType"))
+        event_category = first_present(event.get("category"), event.get("subcategory"), event.get("type"), event.get("collectionType"))
         event_tags = tag_text(event)
         event_slug = first_present(event.get("slug"), event.get("id"))
-        event_end = first_present(event.get("endDate"), event.get("endDateIso"))
+        event_end = first_present(event.get("endDate"), event.get("eventDate"), event.get("endDateIso"))
 
         for market in event.get("markets") or []:
             if not isinstance(market, dict):
@@ -580,18 +662,25 @@ def flatten_event_markets(events: list[dict]) -> list[dict]:
             merged["_event_tags"] = event_tags
             merged["_event_slug"] = event_slug
             merged["_event_end_date"] = event_end
+            merged["_source"] = "polymarket-us-events"
             flattened.append(merged)
     return flattened
 
 
+def amount_value(value: Any) -> float | None:
+    """Polymarket US amount fields may be raw numbers or {value, currency} dicts."""
+    if isinstance(value, dict):
+        return normalize_probability(value.get("value"))
+    return normalize_probability(value)
+
+
 @st.cache_data(ttl=15, show_spinner=False)
-def fetch_order_book(token_id: str) -> dict[str, Any] | None:
-    if not token_id:
+def fetch_market_bbo(slug: str) -> dict[str, Any] | None:
+    if not slug:
         return None
     try:
         response = requests.get(
-            f"{CLOB_BASE_URL}/book",
-            params={"token_id": token_id},
+            f"{POLYMARKET_US_PUBLIC_BASE_URL}/markets/{slug}/bbo",
             headers=REQUEST_HEADERS,
             timeout=2.5,
         )
@@ -602,52 +691,84 @@ def fetch_order_book(token_id: str) -> dict[str, Any] | None:
         return None
 
 
-def best_price(levels: Any, side: str) -> float | None:
-    if not isinstance(levels, list):
+def bbo_market_data(slug: str) -> dict[str, Any] | None:
+    payload = fetch_market_bbo(slug)
+    if not payload:
         return None
-    prices = [optional_float(level.get("price")) for level in levels if isinstance(level, dict)]
-    prices = [price for price in prices if price is not None]
-    if not prices:
-        return None
-    return max(prices) if side == "bid" else min(prices)
+    data = payload.get("marketData") if isinstance(payload, dict) else None
+    return data if isinstance(data, dict) else payload
 
 
-def order_book_snapshot(token_id: str) -> tuple[float | None, float | None, float | None, float | None]:
-    book = fetch_order_book(token_id)
-    if not book:
-        return None, None, None, None
-    bid = best_price(book.get("bids"), "bid")
-    ask = best_price(book.get("asks"), "ask")
+def us_bbo_snapshot(
+    slug: str,
+    outcome_name: str,
+    is_yes_side: bool,
+) -> tuple[float | None, float | None, float | None, float | None, str]:
+    """Return executable buy price for a US market using /markets/{slug}/bbo.
+
+    The US BBO endpoint is market-slug scoped. For a YES/long share, the buy price is bestAsk.
+    For a NO/short share in a binary market, the implied NO ask is 1 - bestBid(YES).
+    For named multi-outcome rows where the side mapping is ambiguous, we leave the Polymarket US list price unchanged.
+    """
+    data = bbo_market_data(slug)
+    if not data:
+        return None, None, None, None, "us_bbo_unavailable"
+
+    yes_bid = amount_value(data.get("bestBid"))
+    yes_ask = amount_value(data.get("bestAsk"))
+    yes_last = amount_value(data.get("lastTradePx")) or amount_value(data.get("currentPx"))
+
+    outcome_upper = str(outcome_name).strip().upper()
+    is_no_side = outcome_upper == "NO"
+
+    if is_yes_side or outcome_upper == "YES":
+        bid, ask = yes_bid, yes_ask
+        source = "us_bbo_ask"
+    elif is_no_side:
+        # Binary complement: buying NO costs approximately 1 - the best YES bid.
+        bid = (1 - yes_ask) if yes_ask is not None else None
+        ask = (1 - yes_bid) if yes_bid is not None else None
+        source = "us_bbo_no_ask"
+    else:
+        return None, yes_bid, yes_ask, yes_last, "us_bbo_ambiguous_side"
+
     mid = None
     spread_pct = None
     if bid is not None and ask is not None and ask >= bid:
         mid = (bid + ask) / 2
         if mid > 0:
             spread_pct = ((ask - bid) / mid) * 100
-    elif bid is not None:
-        mid = bid
-    elif ask is not None:
-        mid = ask
-    return bid, ask, mid, spread_pct
+    elif yes_last is not None:
+        mid = yes_last
+
+    if ask is not None and 0 < ask < 1:
+        return ask, bid, ask, mid, spread_pct, source
+    if mid is not None and 0 < mid < 1:
+        return mid, bid, ask, mid, spread_pct, "us_bbo_mid"
+    return None, bid, ask, mid, spread_pct, "us_bbo_no_executable_ask"
 
 
 def fetch_market_data(config: AnalysisConfig) -> tuple[list[dict], dict[str, int | str]]:
-    """Fetch via /events first because Polymarket docs recommend events for discovery."""
+    """US-only fetch: events first, then markets fallback. No Gamma/global API is used."""
     try:
-        events, stats = fetch_gamma_events(config.page_size, config.fetch_pages)
+        events, stats = fetch_us_events(config.page_size, config.fetch_pages)
         markets = flatten_event_markets(events)
         if markets:
             stats["markets_flattened"] = len(markets)
+            stats["us_only"] = "true"
             return markets, stats
-    except Exception as exc:  # show fallback reason but keep app alive
-        st.warning(f"Gamma /events fetch failed; falling back to /markets. Reason: {exc}")
+    except Exception as exc:
+        st.warning(f"Polymarket US /events fetch failed; falling back to US /markets. Reason: {exc}")
 
     try:
-        markets, stats = fetch_gamma_markets(config.page_size, config.fetch_pages)
+        markets, stats = fetch_us_markets(config.page_size, config.fetch_pages)
+        for market in markets:
+            market["_source"] = "polymarket-us-markets"
+        stats["us_only"] = "true"
         return markets, stats
     except Exception as exc:
-        st.error(f"Gamma market fetch failed: {exc}")
-        return [], {"endpoint": "failed", "error": str(exc)}
+        st.error(f"Polymarket US market fetch failed: {exc}")
+        return [], {"endpoint": "US failed", "base_url": POLYMARKET_US_PUBLIC_BASE_URL, "us_only": "true", "error": str(exc)}
 
 
 # ================== SPORTS DATA LAYER ==================
@@ -939,7 +1060,7 @@ def is_open_market(market: dict) -> bool:
         return False
     if market.get("active") is False:
         return False
-    # Gamma markets usually do not include ep3Status. If it appears and is not OPEN, skip.
+    # Polymarket US markets usually do not include ep3Status. If it appears and is not OPEN, skip.
     ep3 = market.get("ep3Status")
     if ep3 and str(ep3).upper() != "OPEN":
         return False
@@ -1075,16 +1196,17 @@ def market_outcomes(market: dict, config: AnalysisConfig) -> list[ParsedOutcome]
             if not isinstance(side, dict):
                 continue
             name = first_present(side.get("description"), "Yes" if side.get("long") else "No")
-            gamma_price = market_side_price(side)
-            if gamma_price is None:
+            list_price = market_side_price(side)
+            if list_price is None:
                 continue
             team = side.get("team") or {}
             participant = first_present(
                 team.get("safeName"), team.get("name"), team.get("alias"), team.get("displayAbbreviation"), infer_participant(market, name)
             )
             league = first_present(team.get("league"), infer_league(market, participant)).lower()
-            token_id = first_present(side.get("clobTokenId"), side.get("token_id"), side.get("asset_id"))
-            price, bid, ask, mid, spread, source = enrich_price_with_clob(gamma_price, token_id, config)
+            token_id = first_present(side.get("id"), side.get("identifier"), side.get("participantId"), side.get("teamId"))
+            is_yes_side = bool(side.get("long")) or name.strip().upper() == "YES"
+            price, bid, ask, mid, spread, source = enrich_price_with_us_bbo(list_price, market, name, token_id, config, is_yes_side)
             parsed.append(
                 ParsedOutcome(
                     outcome=name,
@@ -1104,16 +1226,17 @@ def market_outcomes(market: dict, config: AnalysisConfig) -> list[ParsedOutcome]
 
     names = [str(x) for x in parse_jsonish_list(market.get("outcomes"))]
     prices = parse_jsonish_list(market.get("outcomePrices"))
-    token_ids = [str(x) for x in parse_jsonish_list(market.get("clobTokenIds"))]
+    token_ids = [str(x) for x in parse_jsonish_list(market.get("clobTokenIds") or market.get("outcomeIds") or market.get("sideIds"))]
 
     for index, name in enumerate(names):
-        gamma_price = normalize_probability(prices[index]) if index < len(prices) else None
-        if gamma_price is None:
+        list_price = normalize_probability(prices[index]) if index < len(prices) else None
+        if list_price is None:
             continue
         token_id = token_ids[index] if index < len(token_ids) else ""
         participant = infer_participant(market, name)
         league = infer_league(market, participant)
-        price, bid, ask, mid, spread, source = enrich_price_with_clob(gamma_price, token_id, config)
+        is_yes_side = name.strip().upper() == "YES"
+        price, bid, ask, mid, spread, source = enrich_price_with_us_bbo(list_price, market, name, token_id, config, is_yes_side)
         parsed.append(
             ParsedOutcome(
                 outcome=name,
@@ -1132,20 +1255,21 @@ def market_outcomes(market: dict, config: AnalysisConfig) -> list[ParsedOutcome]
     return parsed
 
 
-def enrich_price_with_clob(
-    gamma_price: float,
-    token_id: str,
+def enrich_price_with_us_bbo(
+    list_price: float,
+    market: dict,
+    outcome_name: str,
+    side_id: str,
     config: AnalysisConfig,
+    is_yes_side: bool,
 ) -> tuple[float, float | None, float | None, float | None, float | None, str]:
-    if not config.use_live_clob_prices or not token_id:
-        return gamma_price, None, None, None, None, "gamma"
-    bid, ask, mid, spread_pct = order_book_snapshot(token_id)
-    # For a buy/value scanner, the executable cost is best ask. Fall back to Gamma implied price.
-    if ask is not None and 0 < ask < 1:
-        return ask, bid, ask, mid, spread_pct, "clob_ask"
-    if mid is not None and 0 < mid < 1:
-        return mid, bid, ask, mid, spread_pct, "clob_mid"
-    return gamma_price, bid, ask, mid, spread_pct, "gamma_fallback"
+    if not config.use_live_clob_prices:
+        return list_price, None, None, None, None, "us_list"
+    slug = first_present(market.get("slug"))
+    live_price, bid, ask, mid, spread_pct, source = us_bbo_snapshot(slug, outcome_name, is_yes_side)
+    if live_price is not None and 0 < live_price < 1:
+        return live_price, bid, ask, mid, spread_pct, source
+    return list_price, bid, ask, mid, spread_pct, "us_list_bbo_fallback"
 
 
 def side_allowed(outcome: str, config: AnalysisConfig) -> bool:
@@ -1256,14 +1380,14 @@ def build_market_outcomes(markets: list[dict], config: AnalysisConfig) -> tuple[
             stats["Liquidity skipped"] += 1
             continue
 
-        # Do not spend unlimited time hitting orderbook endpoints.
+        # Do not spend unlimited time hitting US BBO endpoints. US BBO is market-slug scoped.
         local_config = config
         if config.use_live_clob_prices:
-            token_count = len(parse_jsonish_list(market.get("clobTokenIds")))
-            if live_tokens_used + token_count > config.live_clob_max_tokens:
+            bbo_call_count = 1 if first_present(market.get("slug")) else 0
+            if live_tokens_used + bbo_call_count > config.live_clob_max_tokens:
                 local_config = AnalysisConfig(**{**config.__dict__, "use_live_clob_prices": False})
             else:
-                live_tokens_used += token_count
+                live_tokens_used += bbo_call_count
 
         outcomes = market_outcomes(market, local_config)
         if not outcomes:
@@ -1362,6 +1486,48 @@ def event_group_key(outcome: MarketOutcome) -> str:
     if re.search(r"\b(spread|total|over|under|handicap)\b|[+-]\d+(?:\.\d+)?", market_text):
         name = outcome.market_name
     return normalize_name(name)
+
+
+def is_futures_market(outcome: MarketOutcome) -> bool:
+    text = f"{outcome.market_name} {outcome.event_name} {outcome.outcome}".lower()
+    futures_patterns = [
+        r"\bworld series\b",
+        r"\bstanley cup\b",
+        r"\bworld cup\b",
+        r"\bchampion(?:ship)?\b",
+        r"\bconference\b",
+        r"\bdivision\b",
+        r"\bseason\b",
+        r"\bplayoffs?\b",
+        r"\bmvp\b",
+        r"\baward\b",
+        r"\b202[6-9]\b",
+        r"\b203[0-9]\b",
+    ]
+    return any(re.search(pattern, text) for pattern in futures_patterns)
+
+
+def conservative_betting_probability(
+    outcome: MarketOutcome,
+    estimate: ProbabilityEstimate,
+    config: AnalysisConfig,
+) -> tuple[float, float]:
+    if not config.use_conservative_betting_probability:
+        return estimate.true_prob, 0.0
+
+    confidence = max(0.0, min(1.0, estimate.confidence))
+    haircut = (config.uncertainty_haircut_pp / 100.0) * (1.0 - confidence)
+
+    # If live bid/ask exists, treat half the spread as additional execution uncertainty.
+    if outcome.live_spread_pct is not None:
+        haircut += min(0.03, max(0.0, outcome.live_spread_pct / 100.0 / 2.0))
+
+    if is_futures_market(outcome):
+        # Futures need injury/bracket/schedule/news/market-movement modeling. Add a conservative penalty.
+        haircut += 0.015
+
+    betting_prob = max(0.001, min(0.999, estimate.true_prob - haircut))
+    return betting_prob, haircut * 100.0
 
 
 def estimate_quality(estimate: ProbabilityEstimate | None) -> str:
@@ -1497,7 +1663,10 @@ def blend_model_with_market_prior(
     blended = market_prior + effective_weight * (model_prob - market_prior)
 
     # Hard cap model movement from the market prior. This prevents weak standings signals from creating absurd edges.
-    max_shift = (config.max_model_shift_pp / 100.0) * max(0.25, confidence)
+    configured_shift_pp = config.max_model_shift_pp
+    if is_futures_market(outcome):
+        configured_shift_pp = min(config.max_model_shift_pp, config.futures_max_shift_pp)
+    max_shift = (configured_shift_pp / 100.0) * max(0.25, confidence)
     shift = max(-max_shift, min(max_shift, blended - market_prior))
     true_prob = max(0.001, min(0.999, market_prior + shift))
 
@@ -1639,6 +1808,9 @@ def build_estimate_display_df(outcomes: list[MarketOutcome], provider: Probabili
                 "Participant": outcome.participant,
                 "Buy Probability": outcome.market_prob * 100,
                 "Auto True Probability %": estimate.true_prob * 100 if estimate else None,
+                "Conservative Betting Probability %": conservative_betting_probability(outcome, estimate, CONFIG)[0] * 100 if estimate else None,
+                "Uncertainty Haircut pp": conservative_betting_probability(outcome, estimate, CONFIG)[1] if estimate else None,
+                "Futures?": "Yes" if is_futures_market(outcome) else "No",
                 "Raw Model Probability %": estimate.model_probability * 100 if estimate and estimate.model_probability is not None else None,
                 "Market Prior %": estimate.market_prior * 100 if estimate and estimate.market_prior is not None else None,
                 "Model Confidence": estimate.confidence if estimate else None,
@@ -1681,6 +1853,10 @@ def analyze_value(
         "Missing true probability": 0,
         "Baseline skipped": 0,
         "Record-only skipped": 0,
+        "Low-confidence skipped": 0,
+        "Futures research-only skipped": 0,
+        "Futures low-confidence skipped": 0,
+        "Live-price-required skipped": 0,
         "Filtered by edge": 0,
         "Filtered by edge pp": 0,
         "Filtered by Kelly": 0,
@@ -1699,10 +1875,25 @@ def analyze_value(
         if config.require_actionable_model and quality == "Record" and not config.allow_record_only_value:
             stats["Record-only skipped"] += 1
             continue
+        if estimate.confidence < config.min_value_confidence:
+            stats["Low-confidence skipped"] += 1
+            continue
+        if config.require_live_prices_for_value and not outcome.price_source.startswith("us_bbo"):
+            stats["Live-price-required skipped"] += 1
+            continue
 
-        edge = relative_edge(estimate.true_prob, outcome.market_prob)
+        futures = is_futures_market(outcome)
+        if futures and not config.allow_futures_value_bets:
+            stats["Futures research-only skipped"] += 1
+            continue
+        if futures and estimate.confidence < config.futures_min_confidence:
+            stats["Futures low-confidence skipped"] += 1
+            continue
+
+        betting_prob, haircut_pp = conservative_betting_probability(outcome, estimate, config)
+        edge = relative_edge(betting_prob, outcome.market_prob)
         edge_pct = edge * 100
-        edge_pp = (estimate.true_prob - outcome.market_prob) * 100
+        edge_pp = (betting_prob - outcome.market_prob) * 100
         if edge_pct < config.min_edge_pct:
             stats["Filtered by edge"] += 1
             continue
@@ -1710,8 +1901,8 @@ def analyze_value(
             stats["Filtered by edge pp"] += 1
             continue
 
-        ev = expected_value_per_dollar(estimate.true_prob, outcome.market_prob)
-        adjusted_kelly = full_kelly_fraction(estimate.true_prob, outcome.market_prob) * config.kelly_fraction
+        ev = expected_value_per_dollar(betting_prob, outcome.market_prob)
+        adjusted_kelly = full_kelly_fraction(betting_prob, outcome.market_prob) * config.kelly_fraction
         capped_kelly = min(adjusted_kelly, config.max_bet_pct / 100)
         kelly_pct = adjusted_kelly * 100
         if kelly_pct < config.min_kelly_pct:
@@ -1725,6 +1916,9 @@ def analyze_value(
                 "Participant": outcome.participant,
                 "Buy Probability": outcome.market_prob,
                 "My True Probability": estimate.true_prob,
+                "Conservative Betting Probability": betting_prob,
+                "Uncertainty Haircut pp": haircut_pp,
+                "Futures?": "Yes" if futures else "No",
                 "Edge %": edge_pct,
                 "Edge pp": edge_pp,
                 "EV %": ev * 100,
@@ -1768,7 +1962,6 @@ def analyze_value(
     stats["Value rows"] = len(df)
     return df, stats
 
-
 def build_edge_review_df(
     outcomes: list[MarketOutcome], provider: ProbabilityProvider, config: AnalysisConfig, limit: int = 40
 ) -> pd.DataFrame:
@@ -1777,13 +1970,23 @@ def build_edge_review_df(
         estimate = provider.get(outcome)
         if not is_actionable_estimate(estimate):
             continue
-        edge = relative_edge(estimate.true_prob, outcome.market_prob)
-        adjusted_kelly = full_kelly_fraction(estimate.true_prob, outcome.market_prob) * config.kelly_fraction
+        futures = is_futures_market(outcome)
+        betting_prob, haircut_pp = conservative_betting_probability(outcome, estimate, config)
+        edge = relative_edge(betting_prob, outcome.market_prob)
+        adjusted_kelly = full_kelly_fraction(betting_prob, outcome.market_prob) * config.kelly_fraction
         edge_pct = edge * 100
-        edge_pp = (estimate.true_prob - outcome.market_prob) * 100
+        edge_pp = (betting_prob - outcome.market_prob) * 100
         blockers = []
         if estimate_quality(estimate) == "Record" and not config.allow_record_only_value:
             blockers.append("record-only disabled")
+        if estimate.confidence < config.min_value_confidence:
+            blockers.append("low confidence")
+        if futures and not config.allow_futures_value_bets:
+            blockers.append("futures research-only")
+        if futures and estimate.confidence < config.futures_min_confidence:
+            blockers.append("futures confidence")
+        if config.require_live_prices_for_value and not outcome.price_source.startswith("us_bbo"):
+            blockers.append("live price required")
         if edge_pct < config.min_edge_pct:
             blockers.append("edge %")
         if edge_pp < config.min_edge_pp:
@@ -1797,9 +2000,12 @@ def build_edge_review_df(
                 "Participant": outcome.participant,
                 "Buy Probability": outcome.market_prob,
                 "My True Probability": estimate.true_prob,
+                "Conservative Betting Probability": betting_prob,
+                "Uncertainty Haircut pp": haircut_pp,
+                "Futures?": "Yes" if futures else "No",
                 "Edge %": edge_pct,
                 "Edge pp": edge_pp,
-                "EV %": expected_value_per_dollar(estimate.true_prob, outcome.market_prob) * 100,
+                "EV %": expected_value_per_dollar(betting_prob, outcome.market_prob) * 100,
                 "Kelly %": adjusted_kelly * 100,
                 "Live Spread %": outcome.live_spread_pct,
                 "Price Source": outcome.price_source,
@@ -1836,6 +2042,14 @@ def display_value_table(df: pd.DataFrame) -> None:
     display_df = df.copy()
     display_df["Buy Probability"] = display_df["Buy Probability"].map("{:.1%}".format)
     display_df["My True Probability"] = display_df["My True Probability"].map("{:.1%}".format)
+    if "Conservative Betting Probability" in display_df:
+        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map("{:.1%}".format)
+    if "Uncertainty Haircut pp" in display_df:
+        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
+    if "Conservative Betting Probability" in display_df:
+        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map("{:.1%}".format)
+    if "Uncertainty Haircut pp" in display_df:
+        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
     display_df["Edge %"] = display_df["Edge %"].map("{:+.1f}%".format)
     display_df["Edge pp"] = display_df["Edge pp"].map("{:+.1f}pp".format)
     display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
@@ -1866,6 +2080,9 @@ def display_value_table(df: pd.DataFrame) -> None:
                 "Participant",
                 "Buy Probability",
                 "My True Probability",
+                "Conservative Betting Probability",
+                "Uncertainty Haircut pp",
+                "Futures?",
                 "Edge %",
                 "Edge pp",
                 "EV %",
@@ -1900,6 +2117,10 @@ def display_edge_review_table(df: pd.DataFrame) -> None:
     display_df = df.copy()
     display_df["Buy Probability"] = display_df["Buy Probability"].map("{:.1%}".format)
     display_df["My True Probability"] = display_df["My True Probability"].map("{:.1%}".format)
+    if "Conservative Betting Probability" in display_df:
+        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map("{:.1%}".format)
+    if "Uncertainty Haircut pp" in display_df:
+        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
     display_df["Edge %"] = display_df["Edge %"].map("{:+.1f}%".format)
     display_df["Edge pp"] = display_df["Edge pp"].map("{:+.1f}pp".format)
     display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
@@ -1930,11 +2151,11 @@ if manual_refresh:
 
 status_box = st.empty()
 status_box.caption(
-    "Loading Gamma markets first. Live CLOB orderbook pricing is OFF by default to avoid Streamlit Cloud hanging; enable it after the table loads."
+    "Loading Polymarket US gateway markets first. Live US BBO pricing is OFF by default; enable it after the table loads."
 )
 
 markets, fetch_stats = fetch_market_data(CONFIG)
-status_box.caption(f"Fetched {len(markets)} Gamma markets. Parsing outcomes and model coverage...")
+status_box.caption(f"Fetched {len(markets)} Polymarket US markets. Parsing outcomes and model coverage...")
 outcomes, scan_stats = build_market_outcomes(markets, CONFIG)
 status_box.empty()
 
@@ -1955,7 +2176,7 @@ if DEBUG_MODE:
     st.stop()
 
 if not outcomes:
-    st.warning("No markets match the current filters. Lower filters or fetch more Gamma pages.")
+    st.warning("No markets match the current filters. Lower filters or fetch more Polymarket US pages.")
     with st.expander("Fetch and scan stats", expanded=True):
         st.write(fetch_stats)
         st.dataframe(pd.DataFrame([{"Step": key, "Count": value} for key, value in scan_stats.items()]), hide_index=True)
@@ -1982,12 +2203,21 @@ metric_cols[1].metric("Non-baseline estimates", actionable_estimate_count)
 metric_cols[2].metric("Baseline only", baseline_estimate_count)
 metric_cols[3].metric("Still missing", max(0, len(outcomes) - auto_estimate_count))
 metric_cols[4].metric("Sports rating keys", len(sports_model_data.ratings))
-metric_cols[5].metric("Live CLOB rows", int((estimate_df.get("Price Source", pd.Series(dtype=str)).astype(str).str.contains("clob")).sum()))
+metric_cols[5].metric("Live US BBO rows", int((estimate_df.get("Price Source", pd.Series(dtype=str)).astype(str).str.contains("us_bbo")).sum()))
 
 if actionable_estimate_count == 0:
     st.warning(
         "No non-baseline estimates were generated for the current filters. This is safer than inventing fake edge. "
         "For true sports/politics/news edge, add a real domain model before betting."
+    )
+
+if not CONFIG.use_live_clob_prices:
+    st.info(
+        "US list prices are good for research, but execution can differ. Turn on live US BBO pricing and lower Max live spread before acting on any candidate."
+    )
+if not CONFIG.allow_futures_value_bets:
+    st.info(
+        "Futures markets are research-only by default. This blocks long-horizon World Cup / Stanley Cup / World Series rows from the final Value Bets table."
     )
 
 with st.expander("Model coverage and scan stats", expanded=False):
@@ -1997,6 +2227,14 @@ with st.expander("Model coverage and scan stats", expanded=False):
         coverage_df["Auto True Probability %"] = coverage_df["Auto True Probability %"].map(
             lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
         )
+        if "Conservative Betting Probability %" in coverage_df:
+            coverage_df["Conservative Betting Probability %"] = coverage_df["Conservative Betting Probability %"].map(
+                lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
+            )
+        if "Uncertainty Haircut pp" in coverage_df:
+            coverage_df["Uncertainty Haircut pp"] = coverage_df["Uncertainty Haircut pp"].map(
+                lambda value: "N/A" if pd.isna(value) else f"{value:.1f}pp"
+            )
         coverage_df["Raw Model Probability %"] = coverage_df["Raw Model Probability %"].map(
             lambda value: "N/A" if pd.isna(value) else f"{value:.1f}%"
         )
@@ -2021,6 +2259,9 @@ with st.expander("Model coverage and scan stats", expanded=False):
                     "Participant",
                     "Buy Probability",
                     "Auto True Probability %",
+                    "Conservative Betting Probability %",
+                    "Uncertainty Haircut pp",
+                    "Futures?",
                     "Raw Model Probability %",
                     "Market Prior %",
                     "Model Confidence",
@@ -2050,7 +2291,7 @@ if edge_review_df.empty:
 else:
     display_edge_review_table(edge_review_df)
 
-st.subheader("3. Value Bets")
+st.subheader("3. Value Bets — Conservative / Execution-Aware")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
 if value_df.empty:
     if actionable_estimate_count == 0:
