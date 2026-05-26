@@ -28,7 +28,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v2.7** — Fixed Open Market Detection + Relaxed Mode")
+st.info("**Production v2.8** — Lenient Value Detection")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -48,18 +48,18 @@ if ODDS_API_KEY:
 else:
     ODDS_API_KEY = st.sidebar.text_input("The Odds API Key", type="password")
 
-RELAXED_MODE = st.sidebar.checkbox("🟢 Relaxed Mode (Show more bets)", value=True)
+RELAXED_MODE = st.sidebar.checkbox("🟢 Relaxed Mode (Recommended)", value=True)
 
 if RELAXED_MODE:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=1.5, step=0.5)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.2, step=0.1)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=5000, step=5000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.35, 0.05)
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=0.8, step=0.2)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.1, step=0.05)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=1000, step=1000)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.3, 0.05)
 else:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=4.0, step=1.0)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.4, step=0.1)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=30000, step=10000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.5, 0.05)
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=3.0, step=0.5)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.3, step=0.1)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=20000, step=5000)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.45, 0.05)
 
 KELLY_FRACTION = st.sidebar.slider("Kelly Fraction", 0.05, 1.0, 0.25, 0.05)
 
@@ -89,14 +89,10 @@ def clear_market_name(market: dict) -> str:
     return " - ".join(filter(None, parts))
 
 def is_open_market(market: dict) -> bool:
-    """Improved detection for current Polymarket data"""
     if market.get("hidden", False) or market.get("archived", False):
         return False
-    if market.get("active") is True:
+    if market.get("active") is True or market.get("ep3Status") in ["OPEN", "ACTIVE", None]:
         return True
-    if market.get("ep3Status") in ["OPEN", "ACTIVE", None]:
-        return True
-    # Allow markets that still have prices
     sides = market.get("marketSides", [])
     if any(optional_float(s.get("price")) not in (None, 0, 1) for s in sides):
         return True
@@ -165,12 +161,7 @@ def fetch_sharp_odds():
         try:
             r = requests.get(
                 f"{THE_ODDS_API_BASE}/sports/{sport}/odds",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": "us",
-                    "markets": "h2h",
-                    "oddsFormat": "decimal"
-                },
+                params={"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "decimal"},
                 timeout=15
             )
             r.raise_for_status()
@@ -347,26 +338,25 @@ def calc_no_complement(estimates, outcomes):
                 result[o.key] = ProbabilityEstimate(1 - yes.true_prob, f"Complement ({yes.source})", yes.is_model, yes.confidence * 0.95)
     return result
 
-# ================== MAIN ==================
+# ================== MAIN LOGIC ==================
 markets = fetch_polymarket()
 sports_data = fetch_sports_model() if USE_AUTO_MODEL else SportsModelData()
 sharp_odds = fetch_sharp_odds()
 
 outcomes = []
-stats = {"total": len(markets), "open": 0, "category_pass": 0, "volume_pass": 0, "final": 0}
+stats = {"total": len(markets), "open": 0, "category": 0, "volume": 0, "final": 0}
 
 for market in markets:
-    if not is_open_market(market):
-        continue
+    if not is_open_market(market): continue
     stats["open"] += 1
 
     category = (market.get("category") or "unknown").lower()
     if not (CAT_ALL or (category == "sports" and CAT_SPORTS)): continue
-    stats["category_pass"] += 1
+    stats["category"] += 1
 
     volume = optional_float(market.get("volumeNum") or market.get("volume"))
     if volume and volume < MIN_VOLUME: continue
-    stats["volume_pass"] += 1
+    stats["volume"] += 1
 
     event_name = clear_market_name(market)
     for side in market.get("marketSides", []):
@@ -399,13 +389,12 @@ stats["final"] = len(outcomes)
 estimates = estimate_probabilities(outcomes, sports_data)
 estimates = calc_no_complement(estimates, outcomes)
 
+# Value bets
 value_rows = []
 for o in outcomes:
     est = estimates.get(o.key)
-    if REQUIRE_MODEL_ONLY and not (est and est.is_model):
-        continue
     if not est:
-        est = ProbabilityEstimate(o.market_prob, "Baseline", False, 0.35)
+        est = ProbabilityEstimate(o.market_prob, "Baseline", False, 0.4)
 
     if est.confidence < MIN_CONFIDENCE: continue
 
@@ -419,7 +408,7 @@ for o in outcomes:
     bet_size = BANKROLL * kelly_full * KELLY_FRACTION
 
     value_rows.append({
-        "Market": o.market_name[:65],
+        "Market": o.market_name[:60],
         "Side": o.outcome,
         "PM Prob%": round(o.market_prob * 100, 1),
         "Model Prob%": round(est.true_prob * 100, 1),
@@ -437,22 +426,23 @@ df = pd.DataFrame(value_rows)
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total Markets", stats["total"])
 col2.metric("Open Markets", stats["open"])
-col3.metric("After Filters", stats["volume_pass"])
+col3.metric("After Filters", stats["volume"])
 col4.metric("Value Bets", len(df))
 
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
 
 if df.empty:
-    st.warning("No value bets found. Try enabling Relaxed Mode and disabling 'Require Strong Model Only'.")
+    st.warning("No value bets yet. Try lowering Edge% and Kelly% further.")
 else:
     df = df.sort_values("Edge%", ascending=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
     st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "value_bets.csv", "text/csv")
 
 if DEBUG_MODE:
-    with st.expander("Debug Statistics"):
+    with st.expander("Debug Info"):
         st.write(stats)
         st.write(f"Sharp Odds Events: {len(sharp_odds)}")
+        st.write(f"Total Outcomes Analyzed: {len(outcomes)}")
 
 st.caption("⚠️ Not financial advice • Model + The Odds API Active")
 
