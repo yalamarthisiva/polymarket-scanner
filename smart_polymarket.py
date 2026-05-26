@@ -2043,13 +2043,13 @@ def display_value_table(df: pd.DataFrame) -> None:
     display_df["Buy Probability"] = display_df["Buy Probability"].map("{:.1%}".format)
     display_df["My True Probability"] = display_df["My True Probability"].map("{:.1%}".format)
     if "Conservative Betting Probability" in display_df:
-        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map("{:.1%}".format)
+        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map(
+            lambda v: "N/A" if pd.isna(v) else f"{float(v):.1%}"
+        )
     if "Uncertainty Haircut pp" in display_df:
-        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
-    if "Conservative Betting Probability" in display_df:
-        display_df["Conservative Betting Probability"] = display_df["Conservative Betting Probability"].map("{:.1%}".format)
-    if "Uncertainty Haircut pp" in display_df:
-        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(lambda v: "N/A" if pd.isna(v) else f"{v:.1f}pp")
+        display_df["Uncertainty Haircut pp"] = display_df["Uncertainty Haircut pp"].map(
+            lambda v: "N/A" if pd.isna(v) else f"{float(v):.1f}pp"
+        )
     display_df["Edge %"] = display_df["Edge %"].map("{:+.1f}%".format)
     display_df["Edge pp"] = display_df["Edge pp"].map("{:+.1f}pp".format)
     display_df["EV %"] = display_df["EV %"].map("{:+.1f}%".format)
