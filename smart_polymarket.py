@@ -26,7 +26,8 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Protocol
 
 import pandas as pd
@@ -154,6 +155,10 @@ class AnalysisConfig:
     futures_min_confidence: float
     futures_max_shift_pp: float
     require_live_prices_for_value: bool
+    live_betting_enabled: bool
+    live_last_call_minutes: int
+    block_started_events: bool
+    enable_live_scoreboard: bool
     recommendation_mode: str
     max_recommended_bets: int
     max_recommended_bets_per_event: int
@@ -228,11 +233,11 @@ class AutoModelProbabilityProvider:
 
 # ================== UI ==================
 st.set_page_config(page_title="Smart Polymarket Value Tool", layout="wide")
-st.title("Smart Polymarket Value Tool — Universal US Scanner")
+st.title("Smart Polymarket Value Tool — US Scanner + Live Safety")
 st.info(
     "US-only mode: uses Polymarket US public API at gateway.polymarket.us for discovery "
     "and optional /markets/{slug}/bbo live prices. Probability estimates are conservative heuristics. "
-    "Futures are research-only by default, and displayed edge is uncertainty-haircut adjusted."
+    "Futures are research-only by default, displayed edge is uncertainty-haircut adjusted, and live/in-game betting is blocked unless explicitly enabled."
 )
 
 st.sidebar.header("Bankroll & Filters")
@@ -413,6 +418,35 @@ REQUIRE_LIVE_PRICES_FOR_VALUE = st.sidebar.checkbox(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Event Timing / Live Betting Safety")
+LIVE_BETTING_ENABLED = st.sidebar.checkbox(
+    "Enable experimental live/in-game recommendations",
+    value=False,
+    help=(
+        "OFF by default. When OFF, markets that appear to have started are marked LIVE/STARTED - research only. "
+        "When ON, live rows can be shown as experimental only when score/clock data is available."
+    ),
+)
+LIVE_LAST_CALL_MINUTES = st.sidebar.slider(
+    "Last-call warning window before start (minutes)",
+    min_value=0,
+    max_value=60,
+    value=10,
+    step=5,
+    help="Markets starting within this many minutes are labeled LAST-CALL and require manual confirmation before execution.",
+)
+BLOCK_STARTED_EVENTS = st.sidebar.checkbox(
+    "Block recommended bets after scheduled start",
+    value=True,
+    help="Recommended for this model. Pre-game probabilities decay quickly once live game state changes.",
+)
+ENABLE_LIVE_SCOREBOARD = st.sidebar.checkbox(
+    "Fetch live score / clock when available",
+    value=False,
+    help="Optional. Uses public ESPN scoreboard-style endpoints for supported sports. If unavailable, the app still uses schedule timing guards.",
+)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Recommendation Mode")
 RECOMMENDATION_MODE = st.sidebar.selectbox(
     "Recommendation mode",
@@ -537,6 +571,10 @@ CONFIG = AnalysisConfig(
     futures_min_confidence=FUTURES_MIN_CONFIDENCE,
     futures_max_shift_pp=FUTURES_MAX_SHIFT_PP,
     require_live_prices_for_value=REQUIRE_LIVE_PRICES_FOR_VALUE,
+    live_betting_enabled=LIVE_BETTING_ENABLED,
+    live_last_call_minutes=LIVE_LAST_CALL_MINUTES,
+    block_started_events=BLOCK_STARTED_EVENTS,
+    enable_live_scoreboard=ENABLE_LIVE_SCOREBOARD,
     recommendation_mode=RECOMMENDATION_MODE,
     max_recommended_bets=MAX_RECOMMENDED_BETS,
     max_recommended_bets_per_event=MAX_RECOMMENDED_BETS_PER_EVENT,
@@ -645,6 +683,232 @@ def tag_text(obj: dict) -> str:
             else:
                 pieces.append(str(tag))
     return " ".join(piece for piece in pieces if piece)
+
+
+ET_TZ = ZoneInfo("America/New_York")
+
+
+def parse_datetime_guess(value: Any) -> datetime | None:
+    """Parse common ISO-ish event timestamps from Polymarket US payloads."""
+    text = first_present(value)
+    if not text:
+        return None
+    for candidate in [text, text.replace("Z", "+00:00")]:
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ET_TZ)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_datetime_from_market_text(text: str) -> datetime | None:
+    """Fallback parser for titles like 'scheduled for Jun 13' or 'scheduled for Jun 13, 2026'.
+
+    When no clock time is present, assume 11:59 PM ET so the app does not prematurely
+    mark an event as started. Real start times should come from the US API when available.
+    """
+    if not text:
+        return None
+    months = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10, "october": 10,
+        "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    pattern = re.compile(
+        r"\b(?P<month>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|"
+        r"Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+        r"\s+(?P<day>\d{1,2})(?:,\s*(?P<year>20\d{2}))?"
+        r"(?:[^0-9aApP]{0,20}(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>AM|PM|am|pm))?"
+    )
+    match = pattern.search(text)
+    if not match:
+        return None
+    now_et = datetime.now(ET_TZ)
+    year = int(match.group("year") or now_et.year)
+    month = months[match.group("month").lower()]
+    day = int(match.group("day"))
+    if match.group("hour"):
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute") or 0)
+        ampm = (match.group("ampm") or "").lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        if ampm == "am" and hour == 12:
+            hour = 0
+    else:
+        hour = 23
+        minute = 59
+    try:
+        dt = datetime(year, month, day, hour, minute, tzinfo=ET_TZ)
+        # If the year was omitted and the parsed date is far in the past, assume next year.
+        if not match.group("year") and dt < now_et - timedelta(days=180):
+            dt = datetime(year + 1, month, day, hour, minute, tzinfo=ET_TZ)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def market_start_datetime(outcome: "MarketOutcome") -> datetime | None:
+    for value in [outcome.end_date]:
+        dt = parse_datetime_guess(value)
+        if dt:
+            return dt
+    return parse_datetime_from_market_text(" ".join([outcome.event_name, outcome.market_name]))
+
+
+def format_et_datetime(dt: datetime | None) -> str:
+    if dt is None:
+        return "Unknown"
+    return dt.astimezone(ET_TZ).strftime("%a %b %-d, %-I:%M %p ET")
+
+
+ESPN_SCOREBOARD_URLS = {
+    "nba": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "nhl": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "mlb": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    # Soccer coverage differs by competition. This endpoint may be empty for some FIFA/World Cup windows.
+    "fifawc": "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
+}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_live_scoreboard_events(league: str) -> list[dict[str, Any]]:
+    url = ESPN_SCOREBOARD_URLS.get((league or "").lower())
+    if not url:
+        return []
+    try:
+        response = requests.get(url, headers=REQUEST_HEADERS, timeout=4)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return []
+    return payload.get("events", []) if isinstance(payload, dict) and isinstance(payload.get("events"), list) else []
+
+
+def _scoreboard_event_summary(event: dict[str, Any]) -> dict[str, Any] | None:
+    competitions = event.get("competitions") or []
+    if not competitions:
+        return None
+    comp = competitions[0] if isinstance(competitions[0], dict) else {}
+    status = comp.get("status") or event.get("status") or {}
+    status_type = status.get("type") or {}
+    state = first_present(status_type.get("state"), status_type.get("name")).lower()
+    status_text = first_present(status_type.get("shortDetail"), status_type.get("detail"), status_type.get("description"), status.get("displayClock"))
+    clock = first_present(status.get("displayClock"), status.get("clock"))
+    period = first_present(status.get("period"))
+    competitors = comp.get("competitors") or []
+    teams = []
+    for c in competitors:
+        team = c.get("team") or {}
+        name = first_present(team.get("displayName"), team.get("shortDisplayName"), team.get("name"), team.get("abbreviation"))
+        score = first_present(c.get("score"))
+        if name:
+            teams.append({"name": name, "score": score, "norm": normalize_name(name)})
+    if not teams:
+        return None
+    score_text = " vs ".join(f"{t['name']} {t['score']}".strip() for t in teams)
+    extra = ""
+    if period or clock:
+        extra = f" | period {period} {clock}".strip()
+    return {
+        "state": state,
+        "status_text": status_text or "Scoreboard available",
+        "score_text": score_text,
+        "summary": f"{score_text} — {status_text}{extra}",
+        "team_norms": [t["norm"] for t in teams],
+    }
+
+
+def live_score_snapshot_for_outcome(outcome: "MarketOutcome", config: "AnalysisConfig") -> dict[str, Any]:
+    if not config.enable_live_scoreboard:
+        return {}
+    events = fetch_live_scoreboard_events(outcome.league)
+    if not events:
+        return {}
+    participant_norm = normalize_name(outcome.participant)
+    market_text = normalize_name(" ".join([outcome.event_name, outcome.market_name]))
+    best = None
+    best_score = 0
+    for event in events:
+        summary = _scoreboard_event_summary(event)
+        if not summary:
+            continue
+        score = 0
+        for team_norm in summary["team_norms"]:
+            if participant_norm and (participant_norm in team_norm or team_norm in participant_norm):
+                score += 5
+            if team_norm and team_norm in market_text:
+                score += 2
+        if score > best_score:
+            best_score = score
+            best = summary
+    return best or {}
+
+
+def event_timing_for_outcome(outcome: "MarketOutcome", config: "AnalysisConfig") -> dict[str, Any]:
+    start_dt = market_start_datetime(outcome)
+    now = datetime.now(timezone.utc)
+    minutes_to_start = None
+    if start_dt:
+        minutes_to_start = (start_dt - now).total_seconds() / 60.0
+
+    score = live_score_snapshot_for_outcome(outcome, config)
+    state = first_present(score.get("state")).lower() if score else ""
+    live_score_summary = first_present(score.get("summary")) if score else ""
+
+    if state in {"in", "in_progress", "live"}:
+        timing = "LIVE - score/clock available"
+    elif state in {"post", "final", "complete", "completed"}:
+        timing = "FINAL / ENDED"
+    elif minutes_to_start is None:
+        timing = "TIME UNKNOWN"
+    elif minutes_to_start > config.live_last_call_minutes:
+        timing = "PRE-GAME"
+    elif 0 <= minutes_to_start <= config.live_last_call_minutes:
+        timing = "LAST-CALL"
+    elif minutes_to_start < 0:
+        # Without a confirmed final status, treat recently-started events as live/research-only.
+        if minutes_to_start > -360:
+            timing = "STARTED / POSSIBLY LIVE"
+        else:
+            timing = "STARTED / LIKELY ENDED"
+    else:
+        timing = "TIME UNKNOWN"
+
+    return {
+        "Event Timing": timing,
+        "Start Time ET": format_et_datetime(start_dt),
+        "Minutes To Start": minutes_to_start,
+        "Live Score": live_score_summary or "N/A",
+        "Scoreboard State": state or "N/A",
+    }
+
+
+def event_timing_hard_action(row: pd.Series, config: "AnalysisConfig") -> str | None:
+    timing = str(row.get("Event Timing") or "").upper()
+    has_score = str(row.get("Live Score") or "N/A") != "N/A"
+    if timing.startswith("FINAL") or timing.startswith("STARTED / LIKELY ENDED"):
+        return "NO TRADE - event ended/expired"
+    if timing.startswith("LIVE") or timing.startswith("STARTED"):
+        if not config.live_betting_enabled or config.block_started_events:
+            return "LIVE - research only"
+        if config.enable_live_scoreboard and has_score:
+            return None
+        return "LIVE WATCHLIST - no score/clock"
+    return None
+
+
+def is_last_call_row(row: pd.Series) -> bool:
+    return str(row.get("Event Timing") or "").upper().startswith("LAST-CALL")
+
+
+def is_live_row(row: pd.Series) -> bool:
+    timing = str(row.get("Event Timing") or "").upper()
+    return timing.startswith("LIVE") or timing.startswith("STARTED")
 
 
 # ================== POLYMARKET US DATA LAYER ==================
@@ -2047,6 +2311,7 @@ def analyze_value(
                 "Effective Model Weight": estimate.effective_model_weight,
                 "Shift Cap pp": estimate.max_shift_pp,
                 "Source": estimate.source,
+                **event_timing_for_outcome(outcome, config),
                 "End Date": outcome.end_date,
                 "Event Group": event_group_key(outcome),
                 "Market Key": outcome.key,
@@ -2124,6 +2389,7 @@ def build_edge_review_df(
                 "Effective Model Weight": estimate.effective_model_weight,
                 "Shift Cap pp": estimate.max_shift_pp,
                 "Source": estimate.source,
+                **event_timing_for_outcome(outcome, config),
                 "Status": "Passes filters" if not blockers else "Below: " + ", ".join(blockers),
             }
         )
@@ -2157,15 +2423,22 @@ def _recommended_action_for_row(row: pd.Series, config: AnalysisConfig, selected
     rest as lower-ranked conflicts. That keeps all value signals visible without producing
     a useless all-NO-TRADE result.
     """
+    timing_action = event_timing_hard_action(row, config)
+    if timing_action:
+        return timing_action
     if row.get("Futures?") == "Yes":
         return "RESEARCH ONLY - futures"
     if not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
         return "NO TRADE - spread too wide"
     if not selected:
         return "SKIP - lower-ranked conflict"
+    if is_live_row(row):
+        prefix = "LIVE EXPERIMENTAL "
+    else:
+        prefix = "LAST-CALL " if is_last_call_row(row) else ""
     if not str(row.get("Price Source") or "").startswith("us_bbo"):
-        return "RECOMMENDED BET - verify live price"
-    return "RECOMMENDED BET"
+        return f"{prefix}RECOMMENDED BET - verify live price"
+    return f"{prefix}RECOMMENDED BET"
 
 
 def action_stake(row: pd.Series) -> float:
@@ -2190,6 +2463,36 @@ def build_action_message(row: pd.Series, action: str, sides: list[str] | None = 
     suggested = action_stake(row)
     spread = row.get("Live Spread %")
     spread_text = "" if pd.isna(spread) else f" Live spread {float(spread):.1f}%."
+    timing = str(row.get("Event Timing") or "")
+    start_time = str(row.get("Start Time ET") or "Unknown")
+    live_score = str(row.get("Live Score") or "N/A")
+
+    if action.startswith("NO TRADE - event ended"):
+        return f"NO TRADE: event appears ended/expired. Start/status: {start_time}; live score: {live_score}."
+    if action.startswith("LIVE EXPERIMENTAL"):
+        clean_action = action.replace("LIVE EXPERIMENTAL ", "")
+        return (
+            f"LIVE EXPERIMENTAL: {clean_action}. Only execute if you manually confirm score/clock and market rules. "
+            f"Score/clock: {live_score}. Current buy <= {buy_prob:.1%}; conservative pre-game fair {fair_prob:.1%}; "
+            f"edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp; stake ${suggested:,.0f}."
+        )
+    if action.startswith("LIVE - research only"):
+        return (
+            f"LIVE/STARTED - RESEARCH ONLY: do not execute from the pre-game model. "
+            f"Timing: {timing}; start/status: {start_time}; score/clock: {live_score}."
+        )
+    if action.startswith("LIVE WATCHLIST"):
+        return (
+            f"LIVE WATCHLIST ONLY: event appears started, but score/clock data is unavailable. "
+            f"Do not execute unless you manually verify the live game state. Start/status: {start_time}."
+        )
+    if action.startswith("LAST-CALL"):
+        base = action.replace("LAST-CALL ", "")
+        return (
+            f"LAST-CALL: event starts soon ({start_time}). {base}: buy {side} only if current ask <= {buy_prob:.1%}, "
+            f"spread is acceptable, and line/market rules match. Conservative fair {fair_prob:.1%}; "
+            f"edge {edge_pct:+.1f}% / {edge_pp:+.1f}pp; stake ${suggested:,.0f}."
+        )
 
     if action.startswith("AGGRESSIVE SAME-EVENT BET - verify"):
         return (
@@ -2296,6 +2599,8 @@ def add_conservative_action_messages(df: pd.DataFrame, config: AnalysisConfig) -
 
         selected_idx = None
         for idx, row in ranked.iterrows():
+            if event_timing_hard_action(row, config):
+                continue
             if row.get("Futures?") == "Yes":
                 continue
             if not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
@@ -2325,7 +2630,14 @@ def add_conservative_action_messages(df: pd.DataFrame, config: AnalysisConfig) -
     priority = {
         "RECOMMENDED BET": 0,
         "RECOMMENDED BET - verify live price": 1,
-        "SKIP - lower-ranked conflict": 2,
+        "LAST-CALL RECOMMENDED BET": 2,
+        "LAST-CALL RECOMMENDED BET - verify live price": 3,
+        "LIVE EXPERIMENTAL RECOMMENDED BET": 4,
+        "LIVE EXPERIMENTAL RECOMMENDED BET - verify live price": 5,
+        "LIVE - research only": 6,
+        "LIVE WATCHLIST - no score/clock": 5,
+        "NO TRADE - event ended/expired": 6,
+        "SKIP - lower-ranked conflict": 7,
         "DUPLICATE - prefer stronger same-side row": 3,
         "RESEARCH ONLY - futures": 4,
         "NO TRADE - spread too wide": 5,
@@ -2378,7 +2690,10 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
             if str(s).strip()
         })
 
-        if row.get("Futures?") == "Yes":
+        timing_action = event_timing_hard_action(row, config)
+        if timing_action:
+            action = timing_action
+        elif row.get("Futures?") == "Yes":
             action = "RESEARCH ONLY - futures"
         elif not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
             action = "NO TRADE - spread too wide"
@@ -2402,10 +2717,14 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
                 else:
                     already_has_event_pick = per_event_count[group] > 0
                     needs_live_check = not str(row.get("Price Source") or "").startswith("us_bbo")
-                    if already_has_event_pick:
-                        action = "AGGRESSIVE SAME-EVENT BET - verify live price" if needs_live_check else "AGGRESSIVE SAME-EVENT BET"
+                    if is_live_row(row):
+                        action_prefix = "LIVE EXPERIMENTAL "
                     else:
-                        action = "AGGRESSIVE BET - verify live price" if needs_live_check else "AGGRESSIVE BET"
+                        action_prefix = "LAST-CALL " if is_last_call_row(row) else ""
+                    if already_has_event_pick:
+                        action = f"{action_prefix}AGGRESSIVE SAME-EVENT BET - verify live price" if needs_live_check else f"{action_prefix}AGGRESSIVE SAME-EVENT BET"
+                    else:
+                        action = f"{action_prefix}AGGRESSIVE BET - verify live price" if needs_live_check else f"{action_prefix}AGGRESSIVE BET"
                     result.at[idx, "Portfolio Bet ($)"] = stake
                     recommended_count += 1
                     per_event_count[group] += 1
@@ -2418,12 +2737,25 @@ def add_aggressive_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> 
 
     priority = {
         "AGGRESSIVE BET": 0,
-        "AGGRESSIVE BET - verify live price": 1,
-        "AGGRESSIVE SAME-EVENT BET": 2,
-        "AGGRESSIVE SAME-EVENT BET - verify live price": 3,
-        "RECOMMENDED BET": 4,
-        "RECOMMENDED BET - verify live price": 5,
-        "SKIP - opposite-side conflict": 6,
+        "LAST-CALL AGGRESSIVE BET": 1,
+        "LAST-CALL AGGRESSIVE BET - verify live price": 2,
+        "AGGRESSIVE BET - verify live price": 3,
+        "AGGRESSIVE SAME-EVENT BET": 4,
+        "AGGRESSIVE SAME-EVENT BET - verify live price": 5,
+        "LAST-CALL AGGRESSIVE SAME-EVENT BET": 6,
+        "LAST-CALL AGGRESSIVE SAME-EVENT BET - verify live price": 7,
+        "LIVE EXPERIMENTAL AGGRESSIVE BET": 8,
+        "LIVE EXPERIMENTAL AGGRESSIVE BET - verify live price": 9,
+        "LIVE EXPERIMENTAL AGGRESSIVE SAME-EVENT BET": 10,
+        "LIVE EXPERIMENTAL AGGRESSIVE SAME-EVENT BET - verify live price": 11,
+        "RECOMMENDED BET": 12,
+        "RECOMMENDED BET - verify live price": 9,
+        "LAST-CALL RECOMMENDED BET": 10,
+        "LAST-CALL RECOMMENDED BET - verify live price": 11,
+        "LIVE - research only": 12,
+        "LIVE WATCHLIST - no score/clock": 13,
+        "NO TRADE - event ended/expired": 14,
+        "SKIP - opposite-side conflict": 15,
         "SKIP - same-event limit": 7,
         "SKIP - event exposure cap": 8,
         "SKIP - portfolio limit": 9,
@@ -2455,6 +2787,18 @@ def actionable_bet_mask(df: pd.DataFrame) -> pd.Series:
         "AGGRESSIVE BET - verify live price",
         "AGGRESSIVE SAME-EVENT BET",
         "AGGRESSIVE SAME-EVENT BET - verify live price",
+        "LAST-CALL RECOMMENDED BET",
+        "LAST-CALL RECOMMENDED BET - verify live price",
+        "LAST-CALL AGGRESSIVE BET",
+        "LAST-CALL AGGRESSIVE BET - verify live price",
+        "LAST-CALL AGGRESSIVE SAME-EVENT BET",
+        "LAST-CALL AGGRESSIVE SAME-EVENT BET - verify live price",
+        "LIVE EXPERIMENTAL RECOMMENDED BET",
+        "LIVE EXPERIMENTAL RECOMMENDED BET - verify live price",
+        "LIVE EXPERIMENTAL AGGRESSIVE BET",
+        "LIVE EXPERIMENTAL AGGRESSIVE BET - verify live price",
+        "LIVE EXPERIMENTAL AGGRESSIVE SAME-EVENT BET",
+        "LIVE EXPERIMENTAL AGGRESSIVE SAME-EVENT BET - verify live price",
     ])
 
 
@@ -2481,6 +2825,9 @@ def display_action_summary(df: pd.DataFrame) -> None:
             "Edge %",
             "Edge pp",
             "Kelly %",
+            "Event Timing",
+            "Start Time ET",
+            "Live Score",
         ]
         if "Portfolio Bet ($)" in df.columns:
             rec_columns.append("Portfolio Bet ($)")
@@ -2510,6 +2857,9 @@ def display_action_summary(df: pd.DataFrame) -> None:
         "Edge %",
         "Edge pp",
         "Kelly %",
+        "Event Timing",
+        "Start Time ET",
+        "Live Score",
     ]
     if "Portfolio Bet ($)" in df.columns:
         summary_columns.append("Portfolio Bet ($)")
@@ -2650,6 +3000,7 @@ def build_universal_us_action_queue(
             "Live Ask": outcome.live_ask,
             "Live Spread %": outcome.live_spread_pct,
             "Price Source": outcome.price_source,
+            **event_timing_for_outcome(outcome, config),
             "Model Quality": quality,
             "Model Confidence": estimate.confidence if estimate else 0.0,
             "Universal Score": score,
@@ -2708,6 +3059,9 @@ def display_universal_us_action_queue(df: pd.DataFrame, config: AnalysisConfig) 
             "Live Bid",
             "Live Ask",
             "Live Spread %",
+            "Event Timing",
+            "Start Time ET",
+            "Live Score",
             "Model Quality",
             "Model Confidence",
             "Universal Score",
@@ -2780,6 +3134,11 @@ def display_value_table(df: pd.DataFrame) -> None:
                 "Conservative Betting Probability",
                 "Uncertainty Haircut pp",
                 "Futures?",
+                "Event Timing",
+                "Start Time ET",
+                "Minutes To Start",
+                "Live Score",
+                "Scoreboard State",
                 "Edge %",
                 "Edge pp",
                 "EV %",
@@ -2917,6 +3276,10 @@ if not CONFIG.use_live_clob_prices:
 if not CONFIG.allow_futures_value_bets:
     st.info(
         "Futures markets are research-only by default. This blocks long-horizon World Cup / Stanley Cup / World Series rows from the final Value Bets table."
+    )
+if not CONFIG.live_betting_enabled:
+    st.info(
+        "Live/in-game betting mode is OFF. Events that appear started are marked research-only; LAST-CALL rows require manual price and market-rule verification."
     )
 
 with st.expander("Model coverage and scan stats", expanded=False):
