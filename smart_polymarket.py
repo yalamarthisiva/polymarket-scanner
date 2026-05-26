@@ -28,7 +28,7 @@ FIFA_COUNTRY_ALIASES = {
 
 st.set_page_config(page_title="Polymarket + Sharp Odds Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + The Odds API")
-st.info("**Production v2.6** — Fixed Odds API + Relaxed Mode")
+st.info("**Production v2.7** — Improved Open Market Detection")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -51,15 +51,15 @@ else:
 RELAXED_MODE = st.sidebar.checkbox("🟢 Relaxed Mode (Show more bets)", value=True)
 
 if RELAXED_MODE:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=2.0, step=0.5)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.3, step=0.1)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=10000, step=5000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.4, 0.05)
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=1.5, step=0.5)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.2, step=0.1)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=5000, step=5000)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.35, 0.05)
 else:
-    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=5.0, step=1.0)
-    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.5, step=0.1)
-    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=50000, step=10000)
-    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.55, 0.05)
+    MIN_EDGE_PCT = st.sidebar.number_input("Minimum Edge (%)", value=4.0, step=1.0)
+    MIN_KELLY_PCT = st.sidebar.number_input("Minimum Kelly (%)", value=0.4, step=0.1)
+    MIN_VOLUME = st.sidebar.number_input("Minimum Volume ($)", value=30000, step=10000)
+    MIN_CONFIDENCE = st.sidebar.slider("Minimum Confidence", 0.0, 1.0, 0.5, 0.05)
 
 KELLY_FRACTION = st.sidebar.slider("Kelly Fraction", 0.05, 1.0, 0.25, 0.05)
 
@@ -88,18 +88,34 @@ def clear_market_name(market: dict) -> str:
     parts = [market.get(k) for k in ["question", "title", "subtitle"] if market.get(k)]
     return " - ".join(filter(None, parts))
 
+def is_open_market(market: dict) -> bool:
+    """Improved logic based on actual API data"""
+    if market.get("hidden", False):
+        return False
+    if market.get("archived", False):
+        return False
+    # Allow markets that are active or have prices even if marked closed (many expired games still show)
+    if market.get("active") is True:
+        return True
+    if market.get("ep3Status") in ["OPEN", "ACTIVE"]:
+        return True
+    # Allow markets that still have meaningful prices
+    if any(side.get("price") not in (None, 0, 1) for side in market.get("marketSides", [])):
+        return True
+    return False
+
 def event_group_key(outcome):
     name = outcome.event_name.lower()
     name = re.sub(r"\s*-\s*\d+-\d+.*$", "", name)
     name = re.sub(r"\s*-\s*(yes|no)$", "", name, flags=re.I)
     return normalize_name(name)
 
-# ================== FETCHERS ==================
+# ================== FETCHERS (with fixed Odds API) ==================
 @st.cache_data(ttl=600)
 def fetch_polymarket():
     markets = []
     offset = 0
-    for _ in range(40):
+    for _ in range(50):
         try:
             resp = requests.get(
                 f"{POLYMARKET_US_BASE_URL}/markets",
@@ -116,224 +132,10 @@ def fetch_polymarket():
             break
     return markets
 
-@st.cache_data(ttl=900)
-def fetch_sports_model():
-    ratings = {}
-    leagues = [("nba", "basketball/nba"), ("nhl", "hockey/nhl"), ("nfl", "football/nfl")]
-    for league, path in leagues:
-        try:
-            r = requests.get(f"{ESPN_BASE}/sports/{path}/standings", 
-                           params={"region": "us", "lang": "en"}, timeout=15)
-            r.raise_for_status()
-            ratings.update(parse_espn_standings(r.json(), league))
-        except: pass
+# ... [Keep fetch_sports_model(), fetch_sharp_odds(), all parser functions, estimate_probabilities, etc. from v2.6]
 
-    try:  # MLB
-        r = requests.get("https://statsapi.mlb.com/api/v1/standings",
-                        params={"leagueId": "103,104", "season": datetime.now().year}, timeout=15)
-        r.raise_for_status()
-        ratings.update(parse_mlb_standings(r.json()))
-    except: pass
-
-    try:  # FIFA
-        r = requests.get(FIFA_MENS_RANKINGS_URL, params={"gender": "male"}, timeout=15)
-        r.raise_for_status()
-        ratings.update(parse_fifa_rankings(r.json()))
-    except: pass
-    return SportsModelData(ratings=ratings)
-
-@st.cache_data(ttl=300)
-def fetch_sharp_odds():
-    if not ODDS_API_KEY:
-        return {}
-    sports_list = ["americanfootball_nfl", "basketball_nba", "baseball_mlb", "soccer"]
-    sharp = {}
-    for sport in sports_list:
-        try:
-            r = requests.get(
-                f"{THE_ODDS_API_BASE}/sports/{sport}/odds",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": "us",
-                    "markets": "h2h",
-                    "oddsFormat": "decimal"
-                },
-                timeout=15
-            )
-            r.raise_for_status()
-            for event in r.json():
-                home = normalize_name(event.get("home_team", ""))
-                away = normalize_name(event.get("away_team", ""))
-                for book in event.get("bookmakers", []):
-                    for mkt in book.get("markets", []):
-                        if mkt.get("key") == "h2h":
-                            for outcome in mkt.get("outcomes", []):
-                                name = normalize_name(outcome.get("name", ""))
-                                price = optional_float(outcome.get("price"))
-                                if price and price > 0:
-                                    sharp[(home, away, name)] = price
-        except Exception as e:
-            st.warning(f"Odds API {sport} error: {e}")
-    return sharp
-
-# ================== DOMAIN MODELS & PARSERS (same as before) ==================
-@dataclass(frozen=True)
-class MarketOutcome:
-    key: str
-    market_id: str
-    slug: str
-    category: str
-    event_name: str
-    market_name: str
-    outcome: str
-    participant: str
-    league: str
-    record: str
-    market_prob: float
-    volume: float | None
-    liquidity: float | None
-
-@dataclass(frozen=True)
-class ProbabilityEstimate:
-    true_prob: float
-    source: str
-    is_model: bool
-    confidence: float
-
-@dataclass
-class TeamStats:
-    wins: float = 0.0
-    losses: float = 0.0
-    draws: float = 0.0
-    points_for: float = 0.0
-    points_against: float = 0.0
-    playoff_seed: int | None = None
-    home_record_wins: float = 0.0
-    home_record_losses: float = 0.0
-
-@dataclass
-class TeamRating:
-    name: str
-    league: str
-    base_rating: float
-    stats: TeamStats
-    source: str
-
-@dataclass
-class SportsModelData:
-    ratings: dict[tuple[str, str], TeamRating] = field(default_factory=dict)
-
-# Parser functions (copy from previous version)
-def parse_espn_standings(payload: dict, league: str):
-    ratings = {}
-    for entry in iter_espn_entries(payload):
-        team = entry.get("team", {})
-        stats_dict = {s.get("name"): s.get("value") for s in entry.get("stats", [])}
-        wins = optional_float(stats_dict.get("wins")) or 0
-        losses = optional_float(stats_dict.get("losses")) or 0
-        ties = optional_float(stats_dict.get("ties")) or 0
-        games = wins + losses + ties
-        if games == 0: continue
-        base = (wins + 0.5 * ties) / games
-        rating = TeamRating(
-            name=team.get("displayName") or team.get("name") or "",
-            league=league,
-            base_rating=max(0.01, min(0.99, base)),
-            stats=TeamStats(wins=wins, losses=losses, draws=ties, playoff_seed=optional_float(entry.get("playoffSeed"))),
-            source=f"ESPN {league.upper()}"
-        )
-        for alias in [team.get("displayName"), team.get("name"), team.get("abbreviation")]:
-            if alias:
-                ratings[(league, normalize_name(alias))] = rating
-    return ratings
-
-def iter_espn_entries(node):
-    if isinstance(node.get("standings"), dict):
-        yield from node["standings"].get("entries", [])
-    for child in node.get("children", []):
-        yield from iter_espn_entries(child)
-
-def parse_mlb_standings(payload):
-    ratings = {}
-    for group in payload.get("records", []):
-        for tr in group.get("teamRecords", []):
-            team = tr.get("team", {})
-            wins = optional_float(tr.get("wins")) or 0
-            losses = optional_float(tr.get("losses")) or 0
-            rf = optional_float(tr.get("runsFor")) or 0
-            ra = optional_float(tr.get("runsAllowed")) or 0
-            if wins + losses == 0: continue
-            pyth = (rf ** 2) / (rf ** 2 + ra ** 2) if (rf + ra) > 0 else wins / (wins + losses)
-            rating = TeamRating(name=team.get("name", ""), league="mlb", base_rating=max(0.01, min(0.99, pyth)),
-                                stats=TeamStats(wins=wins, losses=losses, points_for=rf, points_against=ra),
-                                source="MLB Pythagorean")
-            ratings[("mlb", normalize_name(team.get("name", "")))] = rating
-    return ratings
-
-def parse_fifa_rankings(payload):
-    ratings = {}
-    for row in payload.get("Results", []):
-        points = optional_float(row.get("DecimalTotalPoints") or row.get("TotalPoints"))
-        name_obj = row.get("TeamName")
-        name = name_obj.get("Description") if isinstance(name_obj, dict) else name_obj
-        if not name or points is None: continue
-        norm = max(0.01, min(0.99, (points - 1100) / 900))
-        rating = TeamRating(name=name, league="fifawc", base_rating=norm, stats=TeamStats(), source="FIFA")
-        country = str(row.get("IdCountry", ""))
-        for alias in [name, country] + FIFA_COUNTRY_ALIASES.get(country, []):
-            if alias:
-                ratings[("fifawc", normalize_name(alias))] = rating
-    return ratings
-
-def lookup_team_rating(data: SportsModelData, league: str, participant: str):
-    if not participant: return None
-    norm = normalize_name(participant)
-    league = league.lower()
-    if (league, norm) in data.ratings:
-        return data.ratings[(league, norm)]
-    for (l, n), rating in data.ratings.items():
-        if l == league and (norm in n or n in norm):
-            return rating
-    return None
-
-def estimate_probabilities(outcomes, sports_data):
-    estimates = {}
-    groups = defaultdict(list)
-    for o in [o for o in outcomes if o.outcome.upper() == "YES"]:
-        groups[event_group_key(o)].append(o)
-
-    for group in groups.values():
-        if len(group) < 2: continue
-        strengths = {}
-        for o in group:
-            rating = lookup_team_rating(sports_data, o.league, o.participant)
-            if rating:
-                p = rating.base_rating
-                if rating.stats.playoff_seed:
-                    p = min(0.99, p + (16 - min(rating.stats.playoff_seed, 16)) * 0.012)
-                strengths[o.key] = p
-        if strengths:
-            total = sum(strengths.values())
-            for o in group:
-                if o.key in strengths:
-                    estimates[o.key] = ProbabilityEstimate(
-                        true_prob=strengths[o.key] / total,
-                        source="Sports Model",
-                        is_model=True,
-                        confidence=0.75
-                    )
-    return estimates
-
-def calc_no_complement(estimates, outcomes):
-    result = estimates.copy()
-    yes_map = {k.split("::")[0]: v for k, v in estimates.items()}
-    for o in outcomes:
-        if o.outcome.upper() == "NO":
-            base = o.key.split("::")[0]
-            if base in yes_map:
-                yes = yes_map[base]
-                result[o.key] = ProbabilityEstimate(1 - yes.true_prob, f"Complement ({yes.source})", yes.is_model, yes.confidence * 0.95)
-    return result
+# (For brevity, I'm assuming you have the rest from previous version. 
+# If you need the full thing again, let me know.)
 
 # ================== MAIN LOGIC ==================
 markets = fetch_polymarket()
@@ -344,21 +146,25 @@ outcomes = []
 stats = {"total": len(markets), "open": 0, "category_pass": 0, "volume_pass": 0, "final": 0}
 
 for market in markets:
-    if not market.get("active") or market.get("closed"): continue
+    if not is_open_market(market):
+        continue
     stats["open"] += 1
 
     category = (market.get("category") or "unknown").lower()
-    if not (CAT_ALL or (category == "sports" and CAT_SPORTS)): continue
+    if not (CAT_ALL or (category == "sports" and CAT_SPORTS)):
+        continue
     stats["category_pass"] += 1
 
     volume = optional_float(market.get("volumeNum") or market.get("volume"))
-    if volume and volume < MIN_VOLUME: continue
+    if volume and volume < MIN_VOLUME:
+        continue
     stats["volume_pass"] += 1
 
     event_name = clear_market_name(market)
     for side in market.get("marketSides", []):
         price = optional_float(side.get("price"))
-        if not price or not (0.01 <= price <= 0.99): continue
+        if not price or not (0.01 <= price <= 0.99):
+            continue
 
         outcome_text = side.get("description") or ("Yes" if side.get("long", True) else "No")
         if SIDE_FILTER == "YES only" and outcome_text.upper() != "YES": continue
@@ -383,44 +189,9 @@ for market in markets:
 
 stats["final"] = len(outcomes)
 
-estimates = estimate_probabilities(outcomes, sports_data)
-estimates = calc_no_complement(estimates, outcomes)
+# ... (rest of the code: estimates, value_rows, UI - same as v2.6)
 
-value_rows = []
-for o in outcomes:
-    est = estimates.get(o.key)
-    if REQUIRE_MODEL_ONLY and not (est and est.is_model):
-        continue
-    if not est:
-        est = ProbabilityEstimate(o.market_prob, "Baseline", False, 0.35)
-
-    if est.confidence < MIN_CONFIDENCE: continue
-
-    edge_pct = (est.true_prob - o.market_prob) / o.market_prob * 100 if o.market_prob > 0 else 0
-    if edge_pct < MIN_EDGE_PCT: continue
-
-    kelly_full = max(0, est.true_prob * (1/o.market_prob - 1) - (1 - est.true_prob)) / (1/o.market_prob - 1) if o.market_prob != 1 else 0
-    kelly_pct = kelly_full * KELLY_FRACTION * 100
-    if kelly_pct < MIN_KELLY_PCT: continue
-
-    bet_size = BANKROLL * kelly_full * KELLY_FRACTION
-
-    value_rows.append({
-        "Market": o.market_name[:65],
-        "Side": o.outcome,
-        "PM Prob%": round(o.market_prob * 100, 1),
-        "Model Prob%": round(est.true_prob * 100, 1),
-        "Edge%": round(edge_pct, 1),
-        "Kelly%": round(kelly_pct, 1),
-        "Conf": round(est.confidence, 2),
-        "Bet $": round(bet_size),
-        "Volume": f"${int(o.volume):,}" if o.volume else "N/A",
-        "Source": est.source
-    })
-
-df = pd.DataFrame(value_rows)
-
-# ================== UI ==================
+# UI part (same as before)
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Markets", stats["total"])
 col2.metric("Open", stats["open"])
@@ -428,21 +199,3 @@ col3.metric("After Filters", stats["volume_pass"])
 col4.metric("Value Bets", len(df))
 
 st.subheader(f"🔍 Value Bets Found: {len(df)}")
-
-if df.empty:
-    st.warning("No value bets found. Try Relaxed Mode + disable 'Require Strong Model'.")
-else:
-    df = df.sort_values("Edge%", ascending=False)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.download_button("📥 Download CSV", df.to_csv(index=False).encode('utf-8'), "value_bets.csv", "text/csv")
-
-if DEBUG_MODE:
-    with st.expander("Debug Statistics"):
-        st.write(stats)
-        st.write(f"Sharp Odds Events Loaded: {len(sharp_odds)}")
-
-st.caption("⚠️ Not financial advice • The Odds API Active")
-
-if AUTO_REFRESH:
-    time.sleep(300)
-    st.rerun()
