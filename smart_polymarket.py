@@ -35,7 +35,6 @@ SHARP_SPORTS = [
     "soccer_uefa_champs_league",
 ]
 
-# Keywords that flag a market as a FUTURES/SEASON-LONG bet
 FUTURES_KEYWORDS = [
     "world series", "super bowl", "nba champion", "nfl champion",
     "stanley cup", "championship", "league champion", "win the league",
@@ -48,8 +47,8 @@ FUTURES_KEYWORDS = [
     "primary", "governor", "mayor", "president",
 ]
 
-MAX_PROB_RATIO = 8.0   # Market validation filter threshold
-MAX_EDGE_PCT   = 400.0 # Upper bound safety cap for data artifacts
+MAX_PROB_RATIO = 8.0   
+MAX_EDGE_PCT   = 400.0 
 
 st.set_page_config(page_title="Polymarket Sports Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
@@ -57,7 +56,6 @@ st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
 # ================== SECRETS ==================
 def get_odds_api_key():
     try:
-        # Check if the key exists in Streamlit secrets
         if "THE_ODDS_API_KEY" in st.secrets:
             return st.secrets["THE_ODDS_API_KEY"]
         return None
@@ -439,7 +437,6 @@ def match_sharp_odds_for_outcome(
         fair = vig_free_prob(prices)
         return fair[0] if side == "home" else fair[1]
 
-    # Strategy 1: direct participant name match
     if participant and participant in sharp_by_team:
         entry = sharp_by_team[participant]
         home, away = entry["home"], entry["away"]
@@ -448,7 +445,6 @@ def match_sharp_odds_for_outcome(
         if fp:
             return make_estimate(fp, "Sharp Books (direct)", conf=0.82)
 
-    # Strategy 2: fuzzy team name from market title
     teams = extract_teams_from_title(outcome.event_name)
     for team_raw in teams:
         team_norm = normalize_name(team_raw)
@@ -463,7 +459,6 @@ def match_sharp_odds_for_outcome(
                 if fp:
                     return make_estimate(fp, "Sharp Books (fuzzy)", conf=0.68)
 
-    # Strategy 3: token overlap on event name
     title_tokens = set(normalize_name(outcome.event_name).split())
     stop = {"the","a","an","to","of","in","and","or","for","is","will","who","vs","at"}
     sig_tokens = title_tokens - stop
@@ -554,8 +549,28 @@ for market in markets:
     if not is_open_market(market): continue
     stats["open"] += 1
 
-    category = (market.get("category") or "unknown").lower()
-    if not (CAT_ALL or (CAT_SPORTS and category == "sports")): continue
+    # ========================================================
+    # V5.2 RESILIENT CATEGORY & SPORT DETECTION
+    # ========================================================
+    category = str(market.get("category") or "").lower()
+    sport_field = str(market.get("sport") or "").lower()
+    league_field = str(market.get("league") or "").lower()
+    
+    # Harvest any embedded tag tags or labels
+    tags = [str(t).lower() for t in market.get("tags", [])]
+    
+    is_sports_market = (
+        category == "sports" or 
+        sport_field != "" or 
+        league_field != "" or 
+        "sports" in tags or
+        any(s in league_field for s in ["nba", "nfl", "mlb", "nhl", "soccer", "ufc", "tennis", "fifa"])
+    )
+
+    if not CAT_ALL:
+        if CAT_SPORTS and not is_sports_market: 
+            continue
+            
     stats["category_pass"] += 1
 
     # ========================================================
@@ -582,7 +597,6 @@ for market in markets:
 
     event_name = clear_market_name(market)
 
-    # Multi-path parsing logic
     tokens             = market.get("tokens", [])
     outcome_names      = market.get("outcomes", [])
     outcome_prices_raw = market.get("outcomePrices", [])
@@ -626,19 +640,19 @@ for market in markets:
         else:
             participant = outcome_text
 
-        league = market.get("league", market.get("sport","")).lower()
+        league_val = league_field if league_field else sport_field
         slug   = market.get("slug") or market.get("id") or market.get("conditionId","")
 
         outcomes.append(MarketOutcome(
             key=f"{slug}::{outcome_text.lower()}",
             market_id=str(market.get("id") or market.get("conditionId","")),
             slug=str(slug),
-            category=category,
+            category=category if category else "sports",
             event_name=event_name,
             market_name=event_name,
             outcome=outcome_text,
             participant=participant,
-            league=league,
+            league=league_val,
             record="",
             market_prob=price,
             volume=current_volume,
@@ -648,7 +662,6 @@ for market in markets:
 stats["final"] = len(outcomes)
 stats["futures_skipped"] = sum(1 for o in outcomes if is_futures_market(o.event_name))
 
-# Probability calculations
 model_estimates = estimate_probabilities_model(outcomes, sports_data) if USE_AUTO_MODEL else {}
 
 sharp_estimates = {}
@@ -661,7 +674,6 @@ for o in outcomes:
 combined = {**sharp_estimates, **model_estimates}
 combined = calc_no_complement(combined, outcomes)
 
-# Value validation execution block
 value_rows = []
 for o in outcomes:
     est = combined.get(o.key)
@@ -756,7 +768,6 @@ if DEBUG_MODE:
         st.write(f"**Model estimates:** {len(model_estimates)}")
         st.write(f"**Sharp estimates:** {len(sharp_estimates)}")
         st.write(f"**Combined:** {len(combined)}")
-        st.write(f"**MAX_PROB_RATIO gate:** {MAX_PROB_RATIO}x  |  MAX_EDGE_PCT: {MAX_EDGE_PCT}%")
         if sharp_by_team:
             st.write("**Sample sharp teams:**", list(sharp_by_team.keys())[:20])
         if outcomes:
@@ -770,7 +781,7 @@ if DEBUG_MODE:
                          f"model={est.true_prob if est else 0.0:.2f} "
                          f"src={est.source if est else '—'}")
 
-st.caption("⚠️ Not financial advice • Sharp Odds + Plausibility Guards • v5.1")
+st.caption("⚠️ Not financial advice • Sharp Odds + Plausibility Guards • v5.2")
 
 if st.button("🔄 Refresh Data"):
     st.cache_data.clear()
