@@ -3,7 +3,7 @@ Smart Polymarket US Value Tool - US public API only
 
 Run:
     pip install streamlit pandas requests
-    streamlit run smart_polymarket_value_tool_v4_us_only.py
+    streamlit run smart_polymarket_value_tool_v4_2_us_action_messages.py
 
 What this version fixes:
 - Uses only the Polymarket US public API at https://gateway.polymarket.us/v1.
@@ -12,6 +12,7 @@ What this version fixes:
 - Optionally refreshes live executable buy prices from the lightweight US /markets/{slug}/bbo endpoint.
 - Avoids treating unsupported/no-model markets as value bets unless you explicitly allow them.
 - Keeps the conservative probability / futures-safety model from v3.
+- Adds final Action / Action Message columns so value rows say BET CANDIDATE, NO TRADE, or DUPLICATE instead of leaving the decision ambiguous.
 
 Important: this app is an analysis tool, not financial advice and not an automated trading bot.
 """
@@ -1941,6 +1942,7 @@ def analyze_value(
                 "Shift Cap pp": estimate.max_shift_pp,
                 "Source": estimate.source,
                 "End Date": outcome.end_date,
+                "Event Group": event_group_key(outcome),
                 "Market Key": outcome.key,
                 "Token ID": outcome.token_id,
             }
@@ -2025,6 +2027,155 @@ def build_edge_review_df(
     return df.sort_values("Edge %", ascending=False).head(limit)
 
 
+# ================== FINAL BET DECISION HELPERS ==================
+def clean_side_label(row: pd.Series) -> str:
+    participant = str(row.get("Participant") or "").strip()
+    outcome = str(row.get("Outcome") or "").strip()
+    if participant:
+        return participant
+    return outcome or "Unknown"
+
+
+def normalize_decision_group_label(value: Any) -> str:
+    text = normalize_name(str(value or ""))
+    # Remove trailing record fragments such as 62-20 that may make duplicate markets look unique.
+    text = re.sub(r"\b\d+\s+\d+(?:\s+\d+)?$", "", text).strip()
+    return text or "unknown"
+
+
+def build_action_message(row: pd.Series, action: str, sides: list[str] | None = None) -> str:
+    side = clean_side_label(row)
+    buy_prob = float(row.get("Buy Probability") or 0.0)
+    fair_prob = float(row.get("Conservative Betting Probability") or 0.0)
+    edge_pct = float(row.get("Edge %") or 0.0)
+    suggested = float(row.get("Suggested Bet ($)") or 0.0)
+    spread = row.get("Live Spread %")
+    spread_text = "" if pd.isna(spread) else f" Live spread {float(spread):.1f}%."
+
+    if action.startswith("NO TRADE - conflicting"):
+        side_text = ", ".join(sides or [])
+        return (
+            f"NO TRADE: conflicting value signals in the same event ({side_text}). "
+            "Do not bet either side until only one side remains after live-price validation."
+        )
+    if action.startswith("NO TRADE - spread"):
+        return f"NO TRADE: {side} edge exists, but live spread is too wide.{spread_text}"
+    if action.startswith("DUPLICATE"):
+        return (
+            f"DUPLICATE REVIEW: {side} appears more than once for this event. "
+            "Use the row marked BET CANDIDATE for the same event, not this duplicate row."
+        )
+    if action.startswith("RESEARCH"):
+        return (
+            f"RESEARCH ONLY: {side} shows model value, but this row is not execution-safe. "
+            f"Buy {buy_prob:.1%}, conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%."
+        )
+    if action.startswith("BET CANDIDATE - verify"):
+        return (
+            f"BET CANDIDATE after live check: buy {side} only if current live ask is <= {buy_prob:.1%} "
+            f"and spread is acceptable. Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%, suggested max ${suggested:,.0f}."
+        )
+    return (
+        f"BET CANDIDATE: buy {side} up to {buy_prob:.1%}. "
+        f"Conservative fair {fair_prob:.1%}, edge {edge_pct:+.1f}%, suggested max ${suggested:,.0f}.{spread_text}"
+    )
+
+
+def add_value_action_messages(df: pd.DataFrame, config: AnalysisConfig) -> pd.DataFrame:
+    """Keep every value row visible, but label whether it is actually bettable.
+
+    The important behavior: we do NOT collapse value bets to one row. Multiple rows stay in
+    the Value Bets table, while opposite-side conflicts and duplicates are clearly flagged.
+    """
+    if df.empty:
+        return df
+
+    result = df.copy()
+    if "Event Group" not in result.columns:
+        result["Event Group"] = result["Market"].map(normalize_decision_group_label)
+    result["Decision Group"] = result["Event Group"].map(normalize_decision_group_label)
+    result["Decision Side"] = result.apply(clean_side_label, axis=1)
+    result["Action"] = "BET CANDIDATE"
+    result["Action Message"] = ""
+
+    for _, group_index in result.groupby("Decision Group", sort=False).groups.items():
+        group = result.loc[list(group_index)]
+        sides = sorted({str(side).strip() for side in group["Decision Side"] if str(side).strip()})
+
+        # Opposite-side conflict: keep all rows visible, but do not recommend either side.
+        if len(sides) > 1:
+            for idx in group.index:
+                action = "NO TRADE - conflicting sides"
+                result.at[idx, "Action"] = action
+                result.at[idx, "Action Message"] = build_action_message(result.loc[idx], action, sides)
+            continue
+
+        # Same side appears multiple times. Keep them all visible; only the strongest one is actionable.
+        best_idx = group.sort_values(["Edge %", "Kelly %"], ascending=[False, False]).index[0]
+        for idx in group.index:
+            row = result.loc[idx]
+            action = "BET CANDIDATE"
+            if len(group) > 1 and idx != best_idx:
+                action = "DUPLICATE - prefer best row"
+            elif row.get("Futures?") == "Yes":
+                action = "RESEARCH ONLY - futures"
+            elif not pd.isna(row.get("Live Spread %")) and float(row.get("Live Spread %")) > config.max_live_spread_pct:
+                action = "NO TRADE - spread too wide"
+            elif not str(row.get("Price Source") or "").startswith("us_bbo"):
+                action = "BET CANDIDATE - verify live price"
+
+            result.at[idx, "Action"] = action
+            result.at[idx, "Action Message"] = build_action_message(row, action, sides)
+
+    # Put execution-ready rows first, then verification candidates, then blocked/review rows.
+    priority = {
+        "BET CANDIDATE": 0,
+        "BET CANDIDATE - verify live price": 1,
+        "DUPLICATE - prefer best row": 2,
+        "RESEARCH ONLY - futures": 3,
+        "NO TRADE - spread too wide": 4,
+        "NO TRADE - conflicting sides": 5,
+    }
+    result["Action Rank"] = result["Action"].map(priority).fillna(9).astype(int)
+    return result.sort_values(["Action Rank", "Edge %"], ascending=[True, False], na_position="last")
+
+
+def actionable_bet_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty or "Action" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["Action"].astype(str).isin(["BET CANDIDATE", "BET CANDIDATE - verify live price"])
+
+
+def display_action_summary(df: pd.DataFrame) -> None:
+    if df.empty or "Action Message" not in df.columns:
+        return
+
+    bet_mask = actionable_bet_mask(df)
+    if bet_mask.any():
+        st.success(f"Clear result: {int(bet_mask.sum())} bet candidate(s). Rows below still show all value signals, including duplicates/conflicts.")
+    else:
+        st.warning("Clear result: no execution-safe bet right now. Value signals are shown below, but every row is blocked or review-only.")
+
+    summary_df = df[[
+        "Action",
+        "Action Message",
+        "Market",
+        "Outcome",
+        "Participant",
+        "Buy Probability",
+        "Conservative Betting Probability",
+        "Edge %",
+        "Kelly %",
+        "Suggested Bet ($)",
+    ]].copy()
+    summary_df["Buy Probability"] = summary_df["Buy Probability"].map("{:.1%}".format)
+    summary_df["Conservative Betting Probability"] = summary_df["Conservative Betting Probability"].map("{:.1%}".format)
+    summary_df["Edge %"] = summary_df["Edge %"].map("{:+.1f}%".format)
+    summary_df["Kelly %"] = summary_df["Kelly %"].map("{:.2f}%".format)
+    summary_df["Suggested Bet ($)"] = summary_df["Suggested Bet ($)"].map("${:,.0f}".format)
+    st.dataframe(summary_df, width="stretch", height=260, hide_index=True)
+
+
 # ================== DISPLAY HELPERS ==================
 def format_optional_money(value: Any) -> str:
     if pd.isna(value):
@@ -2075,6 +2226,8 @@ def display_value_table(df: pd.DataFrame) -> None:
     st.dataframe(
         display_df[
             [
+                "Action",
+                "Action Message",
                 "Market",
                 "Outcome",
                 "Participant",
@@ -2105,6 +2258,7 @@ def display_value_table(df: pd.DataFrame) -> None:
                 "Shift Cap pp",
                 "Source",
                 "End Date",
+                "Event Group",
             ]
         ],
         width="stretch",
@@ -2293,6 +2447,8 @@ else:
 
 st.subheader("3. Value Bets — Conservative / Execution-Aware")
 value_df, value_stats = analyze_value(outcomes, auto_provider, CONFIG)
+if not value_df.empty:
+    value_df = add_value_action_messages(value_df, CONFIG)
 if value_df.empty:
     if actionable_estimate_count == 0:
         st.warning("No value bets because no non-baseline estimates were generated.")
@@ -2301,11 +2457,15 @@ if value_df.empty:
     with st.expander("Why no value bets?", expanded=False):
         st.dataframe(pd.DataFrame([{"Step": key, "Count": value} for key, value in value_stats.items()]), hide_index=True)
 else:
-    value_cols = st.columns(4)
-    value_cols[0].metric("Value rows", len(value_df))
-    value_cols[1].metric("Best edge", f"{value_df['Edge %'].max():.1f}%")
-    value_cols[2].metric("Best Kelly", f"{value_df['Kelly %'].max():.2f}%")
-    value_cols[3].metric("Total suggested", f"${value_df['Suggested Bet ($)'].sum():,.0f}")
+    bet_mask = actionable_bet_mask(value_df)
+    candidate_df = value_df.loc[bet_mask]
+    value_cols = st.columns(5)
+    value_cols[0].metric("Value rows shown", len(value_df))
+    value_cols[1].metric("Bet candidates", len(candidate_df))
+    value_cols[2].metric("Best candidate edge", "N/A" if candidate_df.empty else f"{candidate_df['Edge %'].max():.1f}%")
+    value_cols[3].metric("Best candidate Kelly", "N/A" if candidate_df.empty else f"{candidate_df['Kelly %'].max():.2f}%")
+    value_cols[4].metric("Suggested on candidates", f"${candidate_df['Suggested Bet ($)'].sum():,.0f}")
+    display_action_summary(value_df)
     display_value_table(value_df)
     csv = value_df.to_csv(index=False).encode()
     st.download_button("Download value bets CSV", csv, "polymarket_value_bets.csv", "text/csv")
