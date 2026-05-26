@@ -35,8 +35,7 @@ SHARP_SPORTS = [
     "soccer_uefa_champs_league",
 ]
 
-# ── Keywords that flag a market as a FUTURES/SEASON-LONG bet ──────────────────
-# These must NOT be matched against single-game sharp odds.
+# Keywords that flag a market as a FUTURES/SEASON-LONG bet
 FUTURES_KEYWORDS = [
     "world series", "super bowl", "nba champion", "nfl champion",
     "stanley cup", "championship", "league champion", "win the league",
@@ -46,18 +45,14 @@ FUTURES_KEYWORDS = [
     "regular season", "win the season", "finish first", "win their division",
     "qualify for", "relegated", "promoted", "finish top", "finish bottom",
     "presidential", "gubernatorial", "election", "senate", "congress",
-    "primary", "governor", "mayor", "president",           # non-sports
+    "primary", "governor", "mayor", "president",
 ]
 
-# Maximum plausible model–market ratio.
-# If model_prob / market_prob > this, the match is almost certainly wrong
-# (e.g. single-game odds matched to a season-long market).
-MAX_PROB_RATIO = 8.0   # e.g. market=5%, model=40% → ratio 8 → rejected
-MAX_EDGE_PCT   = 400.0  # hard cap; anything above is flagged suspicious
+MAX_PROB_RATIO = 8.0   # Market validation filter threshold
+MAX_EDGE_PCT   = 400.0 # Upper bound safety cap for data artifacts
 
 st.set_page_config(page_title="Polymarket Sports Scanner", layout="wide")
 st.title("🏆 Polymarket Sports Scanner + Sharp Odds")
-st.info("**Production v5.0** — False-Positive Guard + Futures Filter")
 
 # ================== SECRETS ==================
 def get_odds_api_key():
@@ -98,7 +93,9 @@ def normalize_name(value: str) -> str:
 
 def optional_float(value):
     try:
-        return float(value) if value not in (None, "", "null", "None") else None
+        if value in (None, "", "null", "None"):
+            return None
+        return float(value)
     except Exception:
         return None
 
@@ -122,12 +119,10 @@ def event_group_key(outcome) -> str:
     return normalize_name(name)
 
 def is_futures_market(title: str) -> bool:
-    """Return True if this market is a season-long / futures / non-sports bet."""
     t = title.lower()
     return any(kw in t for kw in FUTURES_KEYWORDS)
 
 def extract_teams_from_title(title: str) -> list[str]:
-    """Extract participant names from a market title."""
     patterns = [
         r"will\s+(.+?)\s+(?:beat|win|defeat|cover)",
         r"(.+?)\s+(?:vs\.?|v\.?|@)\s+(.+?)(?:\s+[-–]|\?|$)",
@@ -221,7 +216,7 @@ def fetch_polymarket():
                 markets.extend(items)
             offset += 100
         except Exception as e:
-            st.warning(f"Polymarket fetch error at offset {offset}: {e}")
+            st.sidebar.error(f"Polymarket API offset {offset} failure: {e}")
             break
     return markets
 
@@ -403,23 +398,12 @@ def vig_free_prob(decimal_odds_list: list[float]) -> list[float]:
 
 
 def is_plausible_match(market_prob: float, model_prob: float) -> bool:
-    """
-    Reject matches where the probability ratio is implausibly large.
-    This catches the core bug: season-long market (2%) matched to single-game
-    sharp odds (55%) → ratio 27 → almost certainly wrong.
-
-    Rules:
-      - Ratio model/market must be <= MAX_PROB_RATIO (default 8)
-      - Both must be in [0.04, 0.96] — very extreme probabilities on either
-        side are suspicious
-    """
     if model_prob <= 0 or market_prob <= 0:
         return False
     ratio = model_prob / market_prob
     inv_ratio = market_prob / model_prob
     if max(ratio, inv_ratio) > MAX_PROB_RATIO:
         return False
-    # Reject if market says <4% — single-game sharp odds can't reliably inform these
     if market_prob < 0.04:
         return False
     return True
@@ -430,11 +414,6 @@ def match_sharp_odds_for_outcome(
     sharp_by_team: dict,
     sharp_by_event: dict,
 ) -> ProbabilityEstimate | None:
-    """
-    Map a Polymarket outcome to a sharp-book single-game price.
-    Only valid for NEAR-TERM game markets, not futures/championships.
-    """
-    # ── Gate 1: skip futures and non-sports markets ─────────────────────────
     if is_futures_market(outcome.event_name):
         return None
 
@@ -444,10 +423,9 @@ def match_sharp_odds_for_outcome(
     def make_estimate(true_prob: float, source: str, conf: float) -> ProbabilityEstimate | None:
         tp = true_prob if is_yes else 1 - true_prob
         tp = max(0.01, min(0.99, tp))
-        # ── Gate 2: plausibility check ────────────────────────────────────
         if not is_plausible_match(outcome.market_prob, tp):
             return None
-        return ProbabilityEstimate(true_prob=tp, source=source, is_model=True, confidence=conf)
+        return ProbabilityEstimate(true_prob=tp, source=source, is_model=False, confidence=conf)
 
     def get_fair_prob(home: str, away: str, side: str) -> float | None:
         event = sharp_by_event.get((home, away), {})
@@ -457,7 +435,7 @@ def match_sharp_odds_for_outcome(
         fair = vig_free_prob(prices)
         return fair[0] if side == "home" else fair[1]
 
-    # ── Strategy 1: direct participant name match ─────────────────────────
+    # Strategy 1: direct participant name match
     if participant and participant in sharp_by_team:
         entry = sharp_by_team[participant]
         home, away = entry["home"], entry["away"]
@@ -466,7 +444,7 @@ def match_sharp_odds_for_outcome(
         if fp:
             return make_estimate(fp, "Sharp Books (direct)", conf=0.82)
 
-    # ── Strategy 2: fuzzy team name from market title ─────────────────────
+    # Strategy 2: fuzzy team name from market title
     teams = extract_teams_from_title(outcome.event_name)
     for team_raw in teams:
         team_norm = normalize_name(team_raw)
@@ -481,9 +459,8 @@ def match_sharp_odds_for_outcome(
                 if fp:
                     return make_estimate(fp, "Sharp Books (fuzzy)", conf=0.68)
 
-    # ── Strategy 3: token overlap on event name ───────────────────────────
+    # Strategy 3: token overlap on event name
     title_tokens = set(normalize_name(outcome.event_name).split())
-    # Require at least 3 meaningful overlapping words, not just "the", "win" etc.
     stop = {"the","a","an","to","of","in","and","or","for","is","will","who","vs","at"}
     sig_tokens = title_tokens - stop
 
@@ -528,7 +505,7 @@ def estimate_probabilities_model(outcomes, sports_data: SportsModelData) -> dict
         if strengths:
             total = sum(strengths.values())
             for o in group:
-                if o.key in strengths:
+                if o.key in strengths and total > 0:
                     tp = strengths[o.key] / total
                     if is_plausible_match(o.market_prob, tp):
                         estimates[o.key] = ProbabilityEstimate(
@@ -557,8 +534,8 @@ def calc_no_complement(estimates: dict, outcomes) -> dict:
     return result
 
 
-# ================== MAIN ==================
-markets    = fetch_polymarket()
+# ================== MAIN EXECUTION PIPELINE ==================
+markets     = fetch_polymarket()
 sports_data = fetch_sports_model() if USE_AUTO_MODEL else SportsModelData()
 sharp_by_team, sharp_by_event = fetch_sharp_odds(ODDS_API_KEY)
 
@@ -577,15 +554,19 @@ for market in markets:
     if not (CAT_ALL or (CAT_SPORTS and category == "sports")): continue
     stats["category_pass"] += 1
 
-    volume = optional_float(market.get("volumeNum") or market.get("volume"))
-    if volume is not None and volume < MIN_VOLUME: continue
+    # Production Safe Volume parsing fallback logic chain
+    volume_raw = market.get("volumeNum") or market.get("volume") or market.get("liquidityNum") or market.get("liquidity")
+    volume = optional_float(volume_raw)
+    
+    current_volume = volume if volume is not None else 0.0
+    if current_volume < MIN_VOLUME: continue
     stats["volume_pass"] += 1
 
     event_name = clear_market_name(market)
 
-    # Parse outcome / price pairs from Gamma API format
-    tokens            = market.get("tokens", [])
-    outcome_names     = market.get("outcomes", [])
+    # Multi-path parsing logic structural fix
+    tokens             = market.get("tokens", [])
+    outcome_names      = market.get("outcomes", [])
     outcome_prices_raw = market.get("outcomePrices", [])
 
     pairs: list[tuple[str, float]] = []
@@ -595,7 +576,8 @@ for market in markets:
             price = optional_float(tok.get("price"))
             if name and price is not None:
                 pairs.append((name, price))
-    elif outcome_names and outcome_prices_raw:
+                
+    if not pairs and outcome_names and outcome_prices_raw:
         if isinstance(outcome_prices_raw, str):
             try: outcome_prices_raw = json.loads(outcome_prices_raw)
             except Exception: outcome_prices_raw = []
@@ -606,7 +588,8 @@ for market in markets:
             price = optional_float(price_str)
             if name and price is not None:
                 pairs.append((name, price))
-    else:
+                
+    if not pairs:
         for side in market.get("marketSides", []):
             price = optional_float(side.get("price"))
             name  = side.get("description") or ("Yes" if side.get("long", True) else "No")
@@ -640,16 +623,14 @@ for market in markets:
             league=league,
             record="",
             market_prob=price,
-            volume=volume,
+            volume=current_volume,
             liquidity=optional_float(market.get("liquidityNum") or market.get("liquidity")),
         ))
 
 stats["final"] = len(outcomes)
-
-# Count how many markets would have been futures-filtered
 stats["futures_skipped"] = sum(1 for o in outcomes if is_futures_market(o.event_name))
 
-# ── Probability estimation ───────────────────────────────────────────────────
+# Probability calculations
 model_estimates = estimate_probabilities_model(outcomes, sports_data) if USE_AUTO_MODEL else {}
 
 sharp_estimates = {}
@@ -662,7 +643,7 @@ for o in outcomes:
 combined = {**sharp_estimates, **model_estimates}
 combined = calc_no_complement(combined, outcomes)
 
-# ── Value bet calculation ────────────────────────────────────────────────────
+# Value validation execution block
 value_rows = []
 for o in outcomes:
     est = combined.get(o.key)
@@ -672,7 +653,6 @@ for o in outcomes:
 
     edge_pct = (est.true_prob - o.market_prob) / o.market_prob * 100 if o.market_prob > 0 else 0
     if edge_pct < MIN_EDGE_PCT: continue
-    # Hard cap — anything above this is a data artifact, not a real edge
     if edge_pct > MAX_EDGE_PCT: continue
 
     b = (1.0 / o.market_prob) - 1
@@ -699,7 +679,7 @@ for o in outcomes:
 
 df = pd.DataFrame(value_rows)
 
-# ================== UI ==================
+# ================== UI DISPLAY LAYOUT ==================
 col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Total Markets",     stats["total"])
 col2.metric("Open Markets",      stats["open"])
@@ -738,7 +718,6 @@ else:
         column_config={"Link": st.column_config.LinkColumn("Link", display_text="View")},
     )
 
-    # Summary stats
     sc = st.columns(4)
     sc[0].metric("Avg Edge%",    f"{df_display['Edge%'].mean():.1f}%")
     sc[1].metric("Avg Conf",     f"{df_display['Conf'].mean():.2f}")
@@ -770,7 +749,7 @@ if DEBUG_MODE:
                 st.write(f"  {'🚫FUTURE' if is_fut else '✅GAME  '} "
                          f"{o.event_name[:55]} | {o.outcome} "
                          f"pm={o.market_prob:.2f} "
-                         f"model={est.true_prob:.2f if est else 'n/a'} "
+                         f"model={est.true_prob if est else 0.0:.2f} "
                          f"src={est.source if est else '—'}")
 
 st.caption("⚠️ Not financial advice • Sharp Odds + Plausibility Guards • v5.0")
